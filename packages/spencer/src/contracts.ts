@@ -304,6 +304,12 @@ export interface TransferUpload {
   bytes: AsyncIterable<Uint8Array>;
 }
 
+export interface TransferPreview {
+  name: string;
+  kind: "markdown" | "html";
+  content: string;
+}
+
 export interface TransferService {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -318,6 +324,7 @@ export interface TransferService {
   onBody(ch: string, from: string, body: FileBody): Promise<void>;
   list(ch?: string): Transfer[];
   get(tid: string): Transfer | undefined;
+  preview(tid: string): Promise<TransferPreview>;
 }
 
 // ---------------------------------------------------------------- core → agent

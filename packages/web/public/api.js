@@ -78,6 +78,7 @@ export const api = {
     xhr.send(file);
   }),
   transferAction: (tid, action) => request("POST", `/api/transfers/${enc(tid)}/${action}`),
+  transferPreview: (tid) => request("GET", `/api/transfers/${enc(tid)}/preview`),
   mcp: () => request("GET", "/api/mcp"),
   cancelFollowup: (id) => request("POST", `/api/followups/${enc(id)}/cancel`),
   decideRequest: (id, approve) => request("POST", `/api/requests/${enc(id)}/${approve ? "approve" : "deny"}`),

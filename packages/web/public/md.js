@@ -14,9 +14,9 @@ const plainLeaf = (s) => [document.createTextNode(s)];
  * Render `src` as Markdown. `leaf(text)` turns a run of plain text into nodes (e.g. mention highlighting and
  * URL linkifying); the default is plain text. Returns a DocumentFragment-like array of nodes.
  */
-export function markdown(src, leaf = plainLeaf) {
+export function markdown(src, leaf = plainLeaf, options = {}) {
   try {
-    return blocks(String(src ?? "").replace(/\r\n?/g, "\n").split("\n"), leaf, 0);
+    return blocks(String(src ?? "").replace(/\r\n?/g, "\n").split("\n"), leaf, 0, options);
   } catch (err) {
     console.error("markdown render failed", err);
     return leaf(String(src ?? ""));
@@ -45,11 +45,11 @@ function isTableStart(lines, i) {
   return lines[i].includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]) && lines[i + 1].includes("-");
 }
 
-function blocks(lines, leaf, depth) {
+function blocks(lines, leaf, depth, options = {}) {
   const out = [];
   if (depth > MAX_DEPTH) return [h("p", null, leaf(lines.join("\n")))];
   let i = 0;
-  if (lines.length && HTML_DOC.test(lines.find((l) => !isBlank(l)) ?? "")) return [codeBlock("html", lines.join("\n"))];
+  if (lines.length && HTML_DOC.test(lines.find((l) => !isBlank(l)) ?? "")) return [codeBlock("html", lines.join("\n"), options)];
   while (i < lines.length) {
     const line = lines[i];
     if (isBlank(line)) {
@@ -63,7 +63,7 @@ function blocks(lines, leaf, depth) {
       i++;
       while (i < lines.length && !new RegExp(`^ {0,3}${fence[0] === "`" ? "`" : "~"}{${fence.length},}\\s*$`).test(lines[i])) body.push(lines[i++]);
       i++; // closing fence (or end)
-      out.push(codeBlock(m[2], body.join("\n")));
+      out.push(codeBlock(m[2], body.join("\n"), options));
       continue;
     }
     if ((m = HEADING.exec(line))) {
@@ -79,7 +79,7 @@ function blocks(lines, leaf, depth) {
     if (QUOTE.test(line)) {
       const body = [];
       while (i < lines.length && QUOTE.test(lines[i])) body.push(lines[i++].replace(QUOTE, ""));
-      out.push(h("blockquote", null, blocks(body, leaf, depth + 1)));
+      out.push(h("blockquote", null, blocks(body, leaf, depth + 1, options)));
       continue;
     }
     if (isTableStart(lines, i)) {
@@ -89,7 +89,7 @@ function blocks(lines, leaf, depth) {
       continue;
     }
     if (LIST.test(line)) {
-      const [node, next] = list(lines, i, leaf, depth);
+      const [node, next] = list(lines, i, leaf, depth, options);
       out.push(node);
       i = next;
       continue;
@@ -102,7 +102,7 @@ function blocks(lines, leaf, depth) {
   return out;
 }
 
-function list(lines, start, leaf, depth) {
+function list(lines, start, leaf, depth, options) {
   const first = LIST.exec(lines[start]);
   const base = first[1].length;
   const ordered = /\d/.test(first[2]);
@@ -142,7 +142,7 @@ function list(lines, start, leaf, depth) {
       task = h("input", { type: "checkbox", checked: t[1] !== " ", disabled: true, "aria-label": t[1] !== " " ? "done" : "not done" });
       content[0] = content[0].slice(t[0].length);
     }
-    const inner = blocks(content, leaf, depth + 1);
+    const inner = blocks(content, leaf, depth + 1, options);
     // A single short paragraph renders inline (tight list).
     const kids = inner.length === 1 && inner[0].tagName === "P" ? [...inner[0].childNodes] : inner;
     el.append(h(`li${task ? ".task" : ""}`, null, task, kids));
@@ -194,7 +194,7 @@ function table(lines, start, leaf) {
   return [h("div.md-table", null, h("table", null, thead, h("tbody", null, rows))), i];
 }
 
-function codeBlock(lang, code) {
+function codeBlock(lang, code, options = {}) {
   const l = (lang || "").toLowerCase();
   const pre = h("pre", null, h("code", l ? { "data-lang": l } : null, code));
   const copy = h("button.md-code-btn", { type: "button", title: "Copy code" }, icon("copy", 13), " Copy");
@@ -204,7 +204,7 @@ function codeBlock(lang, code) {
   });
   const bar = h("div.md-code-bar", null, h("span.md-code-lang", null, l || "code"), h("span.spacer"));
   const box = h("div.md-code", null, bar, pre);
-  if (l === "html" || l === "svg" || l === "xml" && /<svg[\s>]/i.test(code)) {
+  if (options.htmlPreview !== false && (l === "html" || l === "svg" || l === "xml" && /<svg[\s>]/i.test(code))) {
     let frame = null;
     const toggle = h("button.md-code-btn", { type: "button", title: "Render this HTML in a sandbox (no scripts)" }, icon("eye", 13), " Preview");
     toggle.addEventListener("click", () => {
@@ -234,7 +234,7 @@ function htmlFrame(html) {
   f.setAttribute("referrerpolicy", "no-referrer");
   f.setAttribute("loading", "lazy");
   f.setAttribute("title", "HTML preview (sandboxed)");
-  f.srcdoc = html;
+  f.srcdoc = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">${html}`;
   return f;
 }
 

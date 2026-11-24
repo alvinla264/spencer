@@ -3,6 +3,8 @@ import { h, icon, humanSize, relTime, timeShort, timeFull, copyText, iconButton 
 import { api, attempt, toast } from "./api.js";
 import { S, TERMINAL, on, needsAction, upsertTransfer, channelTitle, setTransfers } from "./state.js";
 import { viewHeader, emptyState } from "./common.js";
+import { markdown } from "./md.js";
+import { openModal } from "./modal.js";
 
 const STATE_LABEL = {
   awaiting_approval: "needs approval",
@@ -53,6 +55,121 @@ function progressFraction(p) {
 async function act(t, action) {
   const res = await attempt(() => api.transferAction(t.tid, action));
   if (res && res.tid) upsertTransfer(res);
+}
+
+const PREVIEW_EXT = /\.(?:md|markdown|html|htm)$/i;
+
+const STATIC_HTML_TAGS = new Set("article aside blockquote br caption dd div dl dt em figcaption figure footer header h1 h2 h3 h4 h5 h6 hr li main nav ol p pre section small span strong sub summary sup table tbody td tfoot th thead tr ul b i s u del ins mark abbr details code".split(" "));
+const VOID_HTML_TAGS = new Set(["br", "hr"]);
+const DROP_HTML_CONTENT = new Set("script style iframe frame object embed applet form button textarea select option audio video svg math".split(" "));
+const MAX_HTML_NESTING = 64;
+const MAX_HTML_NODES = 20_000;
+const HTML_ENTITIES = { amp: "&", apos: "'", gt: ">", lt: "<", nbsp: "\u00a0", quot: '\"' };
+
+function decodeHtmlText(text) {
+  return text.replace(/&(#(?:x[0-9a-f]+|[0-9]+)|amp|apos|gt|lt|nbsp|quot);/gi, (entity, value) => {
+    if (value[0] !== "#") return HTML_ENTITIES[value.toLowerCase()] ?? entity;
+    const code = Number.parseInt(value[1]?.toLowerCase() === "x" ? value.slice(2) : value.slice(1), value[1]?.toLowerCase() === "x" ? 16 : 10);
+    return Number.isInteger(code) && code > 0 && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff) ? String.fromCodePoint(code) : "\uFFFD";
+  });
+}
+
+function htmlPreview(source, title) {
+  const root = h("div.document-preview-content.html-document", { "aria-label": `HTML preview of ${title}` });
+  const lowerSource = source.toLowerCase();
+  const stack = [root];
+  let nodes = 0;
+  let pos = 0;
+  const truncate = () => {
+    root.append(h("p.document-preview-truncated", null, "Preview truncated because the document is too complex."));
+    return root;
+  };
+  while (pos < source.length) {
+    if (source.startsWith("<!--", pos)) {
+      const end = source.indexOf("-->", pos + 4);
+      pos = end < 0 ? source.length : end + 3;
+      continue;
+    }
+    if (source.startsWith("<!", pos) || source.startsWith("<?", pos)) {
+      const end = source.indexOf(">", pos + 2);
+      pos = end < 0 ? source.length : end + 1;
+      continue;
+    }
+    if (source[pos] === "<") {
+      let i = pos + 1;
+      const closing = source[i] === "/";
+      if (closing) i++;
+      while (i < source.length && " \t\r\n".includes(source[i])) i++;
+      const start = i;
+      while (i < source.length && /[a-z0-9:-]/i.test(source[i])) i++;
+      const tagName = source.slice(start, i).toLowerCase();
+      if (tagName && /[a-z]/i.test(tagName[0])) {
+        let end = i;
+        let quote = "";
+        while (end < source.length) {
+          const c = source[end++];
+          if (quote) {
+            if (c === quote) quote = "";
+          } else if (c === '\"' || c === "'") quote = c;
+          else if (c === ">") break;
+        }
+        const selfClosing = source.slice(pos, end - 1).trimEnd().endsWith("/");
+        pos = end;
+        if (DROP_HTML_CONTENT.has(tagName) && !closing) {
+          const closeStart = lowerSource.indexOf(`</${tagName}`, pos);
+          const closeEnd = closeStart < 0 ? -1 : source.indexOf(">", closeStart + tagName.length + 2);
+          pos = closeEnd < 0 ? source.length : closeEnd + 1;
+          continue;
+        }
+        if (!STATIC_HTML_TAGS.has(tagName)) continue;
+        if (closing) {
+          for (let k = stack.length - 1; k > 0; k--) {
+            if (stack[k].localName === tagName) {
+              stack.length = k;
+              break;
+            }
+          }
+        } else {
+          if (nodes >= MAX_HTML_NODES) return truncate();
+          const el = document.createElement(tagName);
+          stack[stack.length - 1].append(el);
+          nodes++;
+          if (!selfClosing && !VOID_HTML_TAGS.has(tagName)) {
+            if (stack.length >= MAX_HTML_NESTING) return truncate();
+            stack.push(el);
+          }
+        }
+        continue;
+      }
+    }
+    const next = source.indexOf("<", pos + 1);
+    const end = next < 0 ? source.length : next;
+    if (nodes >= MAX_HTML_NODES) return truncate();
+    stack[stack.length - 1].append(document.createTextNode(decodeHtmlText(source.slice(pos, end))));
+    nodes++;
+    pos = end;
+  }
+  return root;
+}
+
+async function previewTransfer(t) {
+  const status = h("p.document-preview-status", { role: "status" }, "Loading preview…");
+  const modal = openModal({ title: `Preview · ${t.name}`, wide: true, cls: "document-preview", body: status });
+  try {
+    const result = await api.transferPreview(t.tid);
+    if (!modal.el.isConnected) return;
+    if (result.kind === "markdown") {
+      const rendered = h("div.document-preview-content.md", null, markdown(result.content, undefined, { htmlPreview: false }));
+      rendered.querySelectorAll("a").forEach((a) => a.replaceWith(...a.childNodes));
+      status.replaceWith(rendered);
+    } else if (result.kind === "html") {
+      status.replaceWith(htmlPreview(result.content, result.name));
+    } else {
+      status.textContent = "This file type is not supported for preview.";
+    }
+  } catch (err) {
+    if (modal.el.isConnected) status.textContent = `Preview unavailable: ${err instanceof Error ? err.message : String(err)}`;
+  }
 }
 
 /** A compact transfer card. opts.showChannel adds the channel name. */
@@ -123,7 +240,7 @@ export function transferCard(t, opts = {}) {
     quarantine = h(
       "div.quarantine",
       null,
-      h("div.quarantine-row", null, h("code.path", { title: t.path }, t.path), iconButton("copy", "Copy path", async () => toast((await copyText(t.path)) ? "Path copied" : "Copy failed", "info"), "sm")),
+      h("div.quarantine-row", null, h("code.path", { title: t.path }, t.path), PREVIEW_EXT.test(t.name) ? h("button.btn.sm", { type: "button", on: { click: () => previewTransfer(t) } }, "Preview") : null, iconButton("copy", "Copy path", async () => toast((await copyText(t.path)) ? "Path copied" : "Copy failed", "info"), "sm")),
       h("p.quarantine-note", null, icon("warn", 14), " In quarantine. Inspect it before you open it."),
     );
   }

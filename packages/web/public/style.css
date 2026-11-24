@@ -2057,6 +2057,29 @@ details[open] > summary > .icon:last-child,
   font-size: 12.5px;
   color: var(--attn);
 }
+.document-preview.modal {
+  width: min(72rem, calc(100vw - 32px));
+  max-width: 72rem;
+}
+.document-preview .modal-body {
+  min-height: 120px;
+  max-height: min(76vh, 900px);
+  overflow: auto;
+}
+.document-preview-status {
+  padding: 20px 4px;
+  color: var(--ink-2);
+}
+.document-preview-content {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.document-preview-content > :first-child {
+  margin-top: 0;
+}
+.document-preview-content > :last-child {
+  margin-bottom: 0;
+}
 .xfer-actions {
   display: flex;
   flex-wrap: wrap;

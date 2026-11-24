@@ -177,6 +177,9 @@ export class StubTransfers implements TransferService {
   get() {
     return undefined;
   }
+  async preview() {
+    return this.nope();
+  }
 }
 
 export interface TestNode {
