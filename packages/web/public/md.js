@@ -234,7 +234,7 @@ function htmlFrame(html) {
   f.setAttribute("referrerpolicy", "no-referrer");
   f.setAttribute("loading", "lazy");
   f.setAttribute("title", "HTML preview (sandboxed)");
-  f.srcdoc = html;
+  f.srcdoc = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">${html}`;
   return f;
 }
 

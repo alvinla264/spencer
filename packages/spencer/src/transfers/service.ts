@@ -2,13 +2,13 @@
  * File transfer state machine (docs/PROTOCOL.md §6). Control messages go through the durable outbox
  * (deps.enqueue, always in the same SQLite transaction as the state change); bytes go through croc.
  */
-import { chmodSync, existsSync, readdirSync, renameSync } from "node:fs";
+import { chmodSync, constants as fsc, existsSync, lstatSync, readdirSync, renameSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { openFrom, random, randomId, sanitizeFileName, sealFor } from "@spencer/protocol";
 import type { FileBody } from "@spencer/protocol";
 import { TERMINAL_STATES } from "../contracts.ts";
-import type { Transfer, TransferDeps, TransferRequest, TransferService, TransferUpload } from "../contracts.ts";
+import type { Transfer, TransferDeps, TransferPreview, TransferRequest, TransferService, TransferUpload } from "../contracts.ts";
 import { CROC_CODE_RE, realCrocRunner } from "./croc.ts";
 import type { CrocExit, CrocJob, CrocRunner } from "./croc.ts";
 import { dirBytes, dirsFor, ensureDir, ensureDirAsync, findReceived, rmrf, sha256File, stageCopy } from "./files.ts";
@@ -28,7 +28,7 @@ export interface TransferServiceOptions {
   watchdogMs?: number;
 }
 
-export type TransferErrorCode = "not_found" | "bad_state" | "bad_request" | "stopped";
+export type TransferErrorCode = "not_found" | "bad_state" | "bad_request" | "stopped" | "too_large" | "invalid_text";
 
 export class TransferError extends Error {
   code: TransferErrorCode;
@@ -91,6 +91,7 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
   const maxUploadBytes = 25 * 1024 * 1024;
   const noRelayRetryMs = options.noRelayRetryMs ?? 5000;
   const watchdogMs = options.watchdogMs ?? 1000;
+  const maxPreviewBytes = 1024 * 1024;
   const store = new TransferStore(deps.db);
   const dirs = dirsFor(deps.dataDir);
   const uploadStagingDir = join(deps.dataDir, "upload-staging");
@@ -959,6 +960,56 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
     get(tid) {
       const r = store.get(tid);
       return r ? toApi(r) : undefined;
+    },
+
+    async preview(tid): Promise<TransferPreview> {
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(tid)) throw new TransferError("bad_request", "invalid transfer id");
+      const r = store.get(tid);
+      if (!r) throw new TransferError("not_found", "unknown transfer");
+      if (r.direction !== "in" || r.state !== "completed") throw new TransferError("bad_request", "only completed incoming files can be previewed");
+      const extension = extname(r.name).toLowerCase();
+      const kind = extension === ".md" || extension === ".markdown" ? "markdown" : extension === ".html" || extension === ".htm" ? "html" : null;
+      if (!kind) throw new TransferError("bad_request", "unsupported preview file type");
+      const expected = resolve(dirs.quarantine, tid, sanitizeFileName(r.name));
+      if (!r.path || resolve(r.path) !== expected) throw new TransferError("bad_request", "file is not at its quarantine location");
+      let handle: Awaited<ReturnType<typeof open>> | undefined;
+      try {
+        const rootStat = lstatSync(dirs.quarantine);
+        const dirStat = lstatSync(join(dirs.quarantine, tid));
+        if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !dirStat.isDirectory() || dirStat.isSymbolicLink()) {
+          throw new TransferError("bad_request", "quarantine location is invalid");
+        }
+        handle = await open(expected, fsc.O_RDONLY | fsc.O_NOFOLLOW);
+        const before = await handle.stat();
+        if (!before.isFile()) throw new TransferError("bad_request", "preview file is not a regular file");
+        if (before.size > maxPreviewBytes) throw new TransferError("too_large", "preview is too large (1 MiB maximum)");
+        const bytes = Buffer.alloc(maxPreviewBytes + 1);
+        let length = 0;
+        while (length < bytes.length) {
+          const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
+          if (!bytesRead) break;
+          length += bytesRead;
+        }
+        if (length > maxPreviewBytes) throw new TransferError("too_large", "preview is too large (1 MiB maximum)");
+        const after = await handle.stat();
+        if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || length !== after.size) {
+          throw new TransferError("bad_request", "preview file changed while being read");
+        }
+        let content: string;
+        try {
+          content = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length));
+        } catch {
+          throw new TransferError("invalid_text", "preview is not valid UTF-8 text");
+        }
+        return { name: r.name, kind, content };
+      } catch (e) {
+        if (e instanceof TransferError) throw e;
+        if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new TransferError("not_found", "preview file is missing from quarantine");
+        if ((e as NodeJS.ErrnoException).code === "ELOOP") throw new TransferError("bad_request", "preview file must not be a symbolic link");
+        throw new TransferError("bad_request", "preview file is unreadable");
+      } finally {
+        await handle?.close().catch(() => {});
+      }
     },
   };
 }

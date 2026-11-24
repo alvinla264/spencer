@@ -1,7 +1,7 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { TransferStore } from "../../src/transfers/store.ts";
@@ -64,6 +64,7 @@ describe("transfers (fake croc)", () => {
     assert.equal(got.direction, "in");
     assert.equal(got.path, join(B.dataDir, "quarantine", t.tid, "report final.pdf"));
     assert.equal(sha(readFileSync(got.path!)), t.sha256);
+    await assert.rejects(B.s.preview(t.tid), (e: unknown) => e instanceof TransferError && e.code === "bad_request");
     assert.equal(statSync(got.path!).mode & 0o777, 0o600);
     assert.equal(got.progress, 1);
     // sender cleaned its staged copy, recipient its incoming dir
@@ -80,6 +81,38 @@ describe("transfers (fake croc)", () => {
     assert.ok(!dump.includes(code));
     assert.equal(A.s.list(ch).length, 1);
     assert.equal(A.s.list(randomId()).length, 0);
+  });
+
+  it("previews only completed incoming Markdown from quarantine", async () => {
+    const { A, B, ch } = await setup({ a: noApproval });
+    const { path } = makeFile(A, "guide.md", 64);
+    writeFileSync(path, "# Safe preview\n\n**formatted** content");
+    const t = await A.s.request(ch, { path, initiatedBy: "owner" });
+    await waitFor(() => A.state(t.tid) === "completed" && B.state(t.tid) === "completed", "completion");
+
+    assert.deepEqual(await B.s.preview(t.tid), { name: "guide.md", kind: "markdown", content: "# Safe preview\n\n**formatted** content" });
+    const received = join(B.dataDir, "quarantine", t.tid, "guide.md");
+    assert.equal(existsSync(received), true);
+    writeFileSync(received, Buffer.from([0xff]));
+    await assert.rejects(B.s.preview(t.tid), (e: unknown) => e instanceof TransferError && e.code === "invalid_text");
+    writeFileSync(received, Buffer.alloc(1024 * 1024 + 1));
+    await assert.rejects(B.s.preview(t.tid), (e: unknown) => e instanceof TransferError && e.code === "too_large");
+    writeFileSync(received, "# Restored fixture");
+    unlinkSync(received);
+    await assert.rejects(B.s.preview(t.tid), (e: unknown) => e instanceof TransferError && e.code === "not_found");
+    await assert.rejects(B.s.preview("../outside"), (e: unknown) => e instanceof TransferError && e.code === "bad_request");
+  });
+
+  it("previews completed incoming HTML as a bounded UTF-8 document", async () => {
+    const { A, B, ch } = await setup({ a: noApproval });
+    const { path } = makeFile(A, "page.html", 64);
+    const html = "<!doctype html><html><body><h1>Fixture</h1><p>Static content</p></body></html>";
+    writeFileSync(path, html);
+    const t = await A.s.request(ch, { path, initiatedBy: "owner" });
+    await waitFor(() => A.state(t.tid) === "completed" && B.state(t.tid) === "completed", "completion");
+
+    assert.deepEqual(await B.s.preview(t.tid), { name: "page.html", kind: "html", content: html });
+    assert.equal(existsSync(join(B.dataDir, "quarantine", t.tid, "page.html")), true);
   });
 
   it("uploaded bytes enter the owner transfer path and partial staging is cleaned", async () => {

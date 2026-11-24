@@ -170,6 +170,8 @@ test("http api: guards, state, owner + channel messages, invites, events ws", as
     assert.equal((await http(port, "POST", uploadUrl, { body: Buffer.from("x"), headers: { ...H, "Content-Type": "application/json" } })).status, 415);
     assert.equal((await http(port, "POST", `/api/transfers/upload?ch=unknown&name=x`, { body: Buffer.from("x"), headers: { ...H, "Content-Type": "application/octet-stream" } })).status, 400);
     assert.equal((await http(port, "POST", "/api/transfers/abc/approve", { headers: H })).status, 404);
+    assert.equal((await http(port, "GET", "/api/transfers/tttttttttttttttttttttt/preview")).status, 401);
+    assert.equal((await http(port, "GET", "/api/transfers/tttttttttttttttttttttt/preview", { headers: H })).status, 404);
     assert.deepEqual((await http(port, "GET", "/api/mcp", { headers: H })).json(), { servers: [] });
     assert.equal((await http(port, "GET", "/api/nope", { headers: H })).status, 404);
 

@@ -70,6 +70,10 @@ function errorStatus(e: unknown): number {
   for (const s of [err?.status, err?.statusCode]) {
     if (typeof s === "number" && s >= 400 && s < 600) return s;
   }
+  if (err?.code === "not_found") return 404;
+  if (err?.code === "bad_request" || err?.code === "invalid_text") return 400;
+  if (err?.code === "bad_state") return 409;
+  if (err?.code === "too_large") return 413;
   if (e instanceof RelayError) {
     switch (e.code) {
       case "full":
@@ -422,6 +426,9 @@ export class ApiServer {
           ...(body.to !== undefined ? { to: body.to as string } : {}),
         });
       }
+    }
+    if ((m = /^\/api\/transfers\/([A-Za-z0-9_-]{1,64})\/preview$/.exec(p)) && method === "GET") {
+      return await b.transfers().preview(m[1]);
     }
     if ((m = /^\/api\/transfers\/([A-Za-z0-9_-]{1,64})$/.exec(p)) && method === "GET") {
       const t = b.transfers().get(m[1]);

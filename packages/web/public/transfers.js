@@ -3,6 +3,8 @@ import { h, icon, humanSize, relTime, timeShort, timeFull, copyText, iconButton 
 import { api, attempt, toast } from "./api.js";
 import { S, TERMINAL, on, needsAction, upsertTransfer, channelTitle, setTransfers } from "./state.js";
 import { viewHeader, emptyState } from "./common.js";
+import { markdown } from "./md.js";
+import { openModal } from "./modal.js";
 
 const STATE_LABEL = {
   awaiting_approval: "needs approval",
@@ -53,6 +55,48 @@ function progressFraction(p) {
 async function act(t, action) {
   const res = await attempt(() => api.transferAction(t.tid, action));
   if (res && res.tid) upsertTransfer(res);
+}
+
+const PREVIEW_EXT = /\.(?:md|markdown|html|htm)$/i;
+
+function inertHtml(source) {
+  const unsafe = "script|iframe|frame|object|embed|applet|form|button|input|textarea|select|option|audio|video|source|track|link|base|meta|svg|math";
+  let html = source.replace(new RegExp(`<\\s*(${unsafe})\\b[^>]*>[\\s\\S]*?<\\/\\s*\\1\\s*>`, "gi"), "");
+  html = html.replace(new RegExp(`<\\/?(?:${unsafe})\\b[^>]*>`, "gi"), "");
+  return html.replace(/<([a-z][^>]*)>/gi, (tag) => tag
+    .replace(/\s(?:href|src|srcset|xlink:href|action|formaction|poster|background|data|manifest|ping|cite|longdesc|usemap|codebase|archive|profile)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, ""));
+}
+
+function htmlPreview(source, name) {
+  const safeHtml = inertHtml(source);
+  const frame = document.createElement("iframe");
+  frame.className = "document-preview-frame";
+  frame.setAttribute("sandbox", "");
+  frame.setAttribute("referrerpolicy", "no-referrer");
+  frame.setAttribute("title", `HTML preview of ${name}`);
+  frame.srcdoc = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'none'; style-src 'unsafe-inline'; font-src 'none'; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'; navigate-to 'none'">${safeHtml}`;
+  return frame;
+}
+
+async function previewTransfer(t) {
+  const status = h("p.document-preview-status", { role: "status" }, "Loading preview…");
+  const modal = openModal({ title: `Preview · ${t.name}`, wide: true, cls: "document-preview", body: status });
+  try {
+    const result = await api.transferPreview(t.tid);
+    if (!modal.el.isConnected) return;
+    if (result.kind === "markdown") {
+      const rendered = h("div.document-preview-content", null, markdown(result.content));
+      rendered.querySelectorAll("a").forEach((a) => a.replaceWith(...a.childNodes));
+      status.replaceWith(rendered);
+    } else if (result.kind === "html") {
+      status.replaceWith(htmlPreview(result.content, result.name));
+    } else {
+      status.textContent = "This file type is not supported for preview.";
+    }
+  } catch (err) {
+    if (modal.el.isConnected) status.textContent = `Preview unavailable: ${err instanceof Error ? err.message : String(err)}`;
+  }
 }
 
 /** A compact transfer card. opts.showChannel adds the channel name. */
@@ -123,7 +167,7 @@ export function transferCard(t, opts = {}) {
     quarantine = h(
       "div.quarantine",
       null,
-      h("div.quarantine-row", null, h("code.path", { title: t.path }, t.path), iconButton("copy", "Copy path", async () => toast((await copyText(t.path)) ? "Path copied" : "Copy failed", "info"), "sm")),
+      h("div.quarantine-row", null, h("code.path", { title: t.path }, t.path), PREVIEW_EXT.test(t.name) ? h("button.btn.sm", { type: "button", on: { click: () => previewTransfer(t) } }, "Preview") : null, iconButton("copy", "Copy path", async () => toast((await copyText(t.path)) ? "Path copied" : "Copy failed", "info"), "sm")),
       h("p.quarantine-note", null, icon("warn", 14), " In quarantine. Inspect it before you open it."),
     );
   }
