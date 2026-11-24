@@ -157,6 +157,18 @@ test("http api: guards, state, owner + channel messages, invites, events ws", as
     const tq = await http(port, "POST", "/api/transfers", { headers: H, body: { ch, path: "/tmp/x" } });
     assert.equal(tq.status, 200);
     assert.equal(A.transfers().requests[0].req.initiatedBy, "owner");
+    const uploadUrl = `/api/transfers/upload?ch=${encodeURIComponent(ch)}&name=${encodeURIComponent("notes <draft>.txt")}&uploadId=upload-key-00000001`;
+    assert.equal((await http(port, "POST", `/api/transfers/upload?ch=${encodeURIComponent(ch)}&name=x`, { body: Buffer.from("x"), headers: { ...H, "Content-Type": "application/octet-stream" } })).status, 400);
+    assert.equal((await http(port, "POST", uploadUrl, { body: Buffer.from("untrusted bytes"), headers: { "Content-Type": "application/octet-stream" } })).status, 401);
+    const uploaded = await http(port, "POST", uploadUrl, { body: Buffer.from("synthetic upload"), headers: { ...H, "Content-Type": "application/octet-stream" } });
+    assert.equal(uploaded.status, 200, uploaded.text);
+    assert.equal(uploaded.json().name, "notes <draft>.txt");
+    assert.equal(A.transfers().requests[1].req.initiatedBy, "owner");
+    assert.equal(A.transfers().requests[1].req.path, "notes <draft>.txt");
+    assert.equal(A.transfers().uploads[0].uploadId, "upload-key-00000001");
+    assert.equal(A.transfers().uploads[0].data.toString(), "synthetic upload");
+    assert.equal((await http(port, "POST", uploadUrl, { body: Buffer.from("x"), headers: { ...H, "Content-Type": "application/json" } })).status, 415);
+    assert.equal((await http(port, "POST", `/api/transfers/upload?ch=unknown&name=x`, { body: Buffer.from("x"), headers: { ...H, "Content-Type": "application/octet-stream" } })).status, 400);
     assert.equal((await http(port, "POST", "/api/transfers/abc/approve", { headers: H })).status, 404);
     assert.deepEqual((await http(port, "GET", "/api/mcp", { headers: H })).json(), { servers: [] });
     assert.equal((await http(port, "GET", "/api/nope", { headers: H })).status, 404);

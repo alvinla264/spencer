@@ -290,12 +290,25 @@ export interface TransferRequest {
   to?: string;
   initiatedBy: "owner" | "owner-agent" | "peer-agent";
   reason?: string;
+  /** Local-only upload retry key; never sent to peers. */
+  uploadId?: string;
+}
+
+export interface TransferUpload {
+  name: string;
+  /** Stable across retries after an ambiguous HTTP response. */
+  uploadId: string;
+  /** Recipient identity; optional for direct channels. */
+  to?: string;
+  /** Bounded by the transfer service before the existing owner-initiated request path is entered. */
+  bytes: AsyncIterable<Uint8Array>;
 }
 
 export interface TransferService {
   start(): Promise<void>;
   stop(): Promise<void>;
   request(ch: string, req: TransferRequest): Promise<Transfer>;
+  requestUpload(ch: string, upload: TransferUpload): Promise<Transfer>;
   approve(tid: string): Transfer;
   deny(tid: string): Transfer;
   accept(tid: string): Transfer;

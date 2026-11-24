@@ -1624,6 +1624,54 @@ details[open] > summary > .icon:last-child,
   position: relative;
   padding: 0 20px 12px;
 }
+.composer.file-drop-target .composer-box {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.draft-attachments:not([hidden]) {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 8px;
+  padding: 9px 11px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.draft-attachment {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink-2);
+}
+.draft-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.draft-state {
+  margin-left: auto;
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.draft-remove {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  color: var(--ink-3);
+  background: none;
+  border: 0;
+  border-radius: 50%;
+  font-size: 20px;
+  line-height: 1;
+}
+.draft-remove:hover { color: var(--bad); background: var(--bad-soft); }
+.draft-remove:disabled { cursor: default; opacity: .45; }
+.draft-recipient { max-width: 100%; margin-top: 4px; }
 .composer-box {
   display: flex;
   align-items: flex-end;

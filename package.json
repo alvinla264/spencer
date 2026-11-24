@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test --test-concurrency=1 'packages/*/test/**/*.test.ts'",
+    "test": "node --test --test-concurrency=1 'packages/*/test/**/*.test.ts' 'packages/web/test/**/*.test.js'",
     "test:unit": "node --test 'packages/protocol/test/**/*.test.ts' 'packages/relay/test/**/*.test.ts'",
     "test:integration": "node --test --test-concurrency=1 'packages/*/test/integration/**/*.test.ts'",
     "build:relay": "node scripts/build-relay.mjs",

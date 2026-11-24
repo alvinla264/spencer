@@ -163,26 +163,31 @@ setInterval(() => {
 
 /**
  * A multi-line composer. Enter sends, Shift+Enter adds a line.
- * opts: {placeholder, label, hint?: (string|Node)[], left?: Node, popup?: Node, onKey?(e) → handled, onSend(text) → truthy on success}
+ * opts: {placeholder, label, hint?: (string|Node)[], left?: Node, popup?: Node, drafts?: Node, canSend?() → boolean, initialText?: string, onTextChange?(text), isBusy?() → boolean, onKey?(e) → handled, onSend(text) → truthy on success}
  */
-export function composer({ placeholder, label, hint, left, popup, onKey, onSend }) {
+export function composer({ placeholder, label, hint, left, popup, drafts, canSend, initialText, onTextChange, isBusy, onKey, onSend }) {
   const input = h("textarea.composer-input", { rows: "1", placeholder, "aria-label": label, enterkeyhint: "send" });
+  input.value = initialText ?? "";
   const sendBtn = h("button.send-btn", { type: "submit", "aria-label": "Send", title: "Send (Enter)", disabled: true }, icon("up", 18));
-  const form = h("form.composer", null, popup, h("div.composer-box", null, left, input, sendBtn), hint ? h("p.composer-hint", null, hint) : null);
+  const form = h("form.composer", null, popup, drafts, h("div.composer-box", null, left, input, sendBtn), hint ? h("p.composer-hint", null, hint) : null);
+  let busy = false;
   const sync = () => {
-    sendBtn.disabled = !input.value.trim();
+    const externallyBusy = !!isBusy?.();
+    sendBtn.disabled = busy || externallyBusy || !(input.value.trim() || canSend?.());
+    if (isBusy) input.disabled = busy || externallyBusy;
     autoGrow(input);
   };
   const submit = async () => {
     const text = input.value.trim();
-    if (!text) return;
+    if (busy || (!text && !canSend?.())) return;
+    busy = true;
     input.value = "";
     sync();
-    const ok = await onSend(text);
-    if (!ok && !input.value) {
-      input.value = text; // sending failed: give the text back
-      sync();
-    }
+    let ok = false;
+    try { ok = await onSend(text); } finally { busy = false; }
+    if (!ok && !input.value) input.value = text; // sending failed: give the text back
+    onTextChange?.(input.value);
+    sync();
   };
   form.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -195,7 +200,7 @@ export function composer({ placeholder, label, hint, left, popup, onKey, onSend 
       submit();
     }
   });
-  input.addEventListener("input", sync);
+  input.addEventListener("input", () => { onTextChange?.(input.value); sync(); });
   return { form, input, sync };
 }
 

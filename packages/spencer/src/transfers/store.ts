@@ -4,6 +4,8 @@ import type { Transfer, TransferDirection, TransferInitiator } from "../contract
 /** A persisted transfer row (superset of the API `Transfer`). */
 export interface TransferRow {
   tid: string;
+  /** Local-only upload retry key; absent for all other transfer origins. */
+  uploadId: string | null;
   ch: string;
   direction: TransferDirection;
   peer: string;
@@ -31,6 +33,7 @@ export interface TransferRow {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS transfers (
   tid TEXT PRIMARY KEY,
+  upload_id TEXT,
   ch TEXT NOT NULL,
   direction TEXT NOT NULL,
   peer TEXT NOT NULL,
@@ -57,6 +60,7 @@ CREATE INDEX IF NOT EXISTS transfers_state ON transfers(state);
 
 const COLS: Record<keyof TransferRow, string> = {
   tid: "tid",
+  uploadId: "upload_id",
   ch: "ch",
   direction: "direction",
   peer: "peer",
@@ -89,6 +93,7 @@ function toSql(k: keyof TransferRow, v: unknown): SqlValue {
 function fromSql(r: Record<string, unknown>): TransferRow {
   return {
     tid: r.tid as string,
+    uploadId: (r.upload_id as string | null) ?? null,
     ch: r.ch as string,
     direction: r.direction as TransferDirection,
     peer: r.peer as string,
@@ -120,7 +125,10 @@ export class TransferStore {
   constructor(db: DatabaseSync) {
     this.db = db;
     db.exec(SCHEMA);
-    if (!db.prepare("PRAGMA table_info(transfers)").all().some((column) => column.name === "via")) db.exec("ALTER TABLE transfers ADD COLUMN via TEXT");
+    const columns = db.prepare("PRAGMA table_info(transfers)").all();
+    if (!columns.some((column) => column.name === "via")) db.exec("ALTER TABLE transfers ADD COLUMN via TEXT");
+    if (!columns.some((column) => column.name === "upload_id")) db.exec("ALTER TABLE transfers ADD COLUMN upload_id TEXT");
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS transfers_upload_id ON transfers(upload_id) WHERE upload_id IS NOT NULL");
   }
 
   /**
@@ -143,6 +151,11 @@ export class TransferStore {
 
   get(tid: string): TransferRow | undefined {
     const r = this.db.prepare("SELECT * FROM transfers WHERE tid = ?").get(tid) as Record<string, unknown> | undefined;
+    return r ? fromSql(r) : undefined;
+  }
+
+  byUploadId(uploadId: string): TransferRow | undefined {
+    const r = this.db.prepare("SELECT * FROM transfers WHERE upload_id = ?").get(uploadId) as Record<string, unknown> | undefined;
     return r ? fromSql(r) : undefined;
   }
 

@@ -15,6 +15,7 @@ import type {
   TransferDeps,
   TransferRequest,
   TransferService,
+  TransferUpload,
 } from "../../src/contracts.ts";
 import type { FileBody } from "@spencer/protocol";
 
@@ -112,6 +113,7 @@ export class StubTransfers implements TransferService {
   deps: TransferDeps;
   bodies: { ch: string; from: string; body: FileBody }[] = [];
   requests: { ch: string; req: TransferRequest }[] = [];
+  uploads: { ch: string; name: string; to?: string; uploadId: string; data: Buffer }[] = [];
   constructor(deps: TransferDeps) {
     this.deps = deps;
   }
@@ -119,18 +121,30 @@ export class StubTransfers implements TransferService {
   async stop() {}
   async request(ch: string, req: TransferRequest): Promise<Transfer> {
     this.requests.push({ ch, req });
+    return this.transfer(ch, req.path, req.to, req.initiatedBy);
+  }
+  async requestUpload(ch: string, upload: TransferUpload): Promise<Transfer> {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of upload.bytes) chunks.push(chunk);
+    const data = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+    this.uploads.push({ ch, name: upload.name, to: upload.to, uploadId: upload.uploadId, data });
+    const req = { path: upload.name, to: upload.to, uploadId: upload.uploadId, initiatedBy: "owner" as const };
+    this.requests.push({ ch, req });
+    return this.transfer(ch, upload.name, upload.to, "owner");
+  }
+  private transfer(ch: string, name: string, to: string | undefined, initiatedBy: TransferRequest["initiatedBy"]): Transfer {
     const now = Date.now();
     return {
       tid: "t".repeat(22),
       ch,
       direction: "out",
-      peer: req.to ?? this.deps.peers(ch)[0] ?? "",
-      name: req.path,
+      peer: to ?? this.deps.peers(ch)[0] ?? "",
+      name,
       size: 0,
       sha256: "0".repeat(64),
       state: "awaiting_approval",
       attempt: 0,
-      initiatedBy: req.initiatedBy,
+      initiatedBy,
       createdAt: now,
       updatedAt: now,
       expiresAt: now + 1000,
@@ -241,7 +255,7 @@ export function http(
   opts: { headers?: Record<string, string>; body?: unknown; host?: string } = {},
 ): Promise<HttpResult> {
   return new Promise((resolve, reject) => {
-    const data = opts.body === undefined ? undefined : Buffer.from(typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body));
+    const data = opts.body === undefined ? undefined : Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body));
     const req = httpRequest(
       {
         host: "127.0.0.1",

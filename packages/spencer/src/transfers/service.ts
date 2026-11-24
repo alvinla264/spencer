@@ -3,12 +3,12 @@
  * (deps.enqueue, always in the same SQLite transaction as the state change); bytes go through croc.
  */
 import { chmodSync, existsSync, readdirSync, renameSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { open, stat } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 import { openFrom, random, randomId, sanitizeFileName, sealFor } from "@spencer/protocol";
 import type { FileBody } from "@spencer/protocol";
 import { TERMINAL_STATES } from "../contracts.ts";
-import type { Transfer, TransferDeps, TransferRequest, TransferService } from "../contracts.ts";
+import type { Transfer, TransferDeps, TransferRequest, TransferService, TransferUpload } from "../contracts.ts";
 import { CROC_CODE_RE, realCrocRunner } from "./croc.ts";
 import type { CrocExit, CrocJob, CrocRunner } from "./croc.ts";
 import { dirBytes, dirsFor, ensureDir, ensureDirAsync, findReceived, rmrf, sha256File, stageCopy } from "./files.ts";
@@ -88,10 +88,12 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
     });
   const backoff = options.backoffMs ?? defaultBackoff;
   const sweepIntervalMs = options.sweepIntervalMs ?? 30_000;
+  const maxUploadBytes = 25 * 1024 * 1024;
   const noRelayRetryMs = options.noRelayRetryMs ?? 5000;
   const watchdogMs = options.watchdogMs ?? 1000;
   const store = new TransferStore(deps.db);
   const dirs = dirsFor(deps.dataDir);
+  const uploadStagingDir = join(deps.dataDir, "upload-staging");
 
   const jobs = new Map<string, Running>();
   const linkTried = new Map<string, number>();
@@ -556,6 +558,7 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
     const auto = policy.autoAcceptIncomingFiles && b.size <= policy.maxIncomingFileBytes;
     const row: TransferRow = {
       tid: b.tid,
+      uploadId: null,
       ch,
       direction: "in",
       peer: from,
@@ -633,6 +636,17 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
     }
   }
 
+  function clearStaleUploadStaging(): void {
+    ensureDir(uploadStagingDir);
+    let names: string[];
+    try {
+      names = readdirSync(uploadStagingDir);
+    } catch {
+      return;
+    }
+    for (const name of names) rmrf(join(uploadStagingDir, name));
+  }
+
   function removeOrphanDirs(): void {
     const live = new Set(store.nonTerminal().map((r) => r.tid));
     for (const base of [dirs.outgoing, dirs.incoming]) {
@@ -684,6 +698,7 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
         /* best effort */
       }
       for (const d of [dirs.outgoing, dirs.incoming, dirs.quarantine]) ensureDir(d);
+      clearStaleUploadStaging();
       sweep();
       removeOrphanDirs();
       await recover();
@@ -732,8 +747,19 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
       } else {
         throw new TransferError("bad_request", "`to` is required in group channels");
       }
-      const tid = randomId();
       const name = sanitizeFileName(basename(req.path));
+      if (req.uploadId !== undefined) {
+        if (!/^[A-Za-z0-9_-]{16,64}$/.test(req.uploadId)) throw new TransferError("bad_request", "invalid upload retry id");
+        const previous = store.byUploadId(req.uploadId);
+        if (previous) {
+          const sha256 = await sha256File(req.path);
+          if (previous.ch !== ch || previous.peer !== to || previous.name !== name || previous.size !== st.size || previous.sha256 !== sha256) {
+            throw new TransferError("bad_request", "upload retry id was already used for different content or recipient");
+          }
+          return toApi(previous);
+        }
+      }
+      const tid = randomId();
       const dir = outDir(tid);
       const staged = join(dir, name);
       let size: number;
@@ -758,6 +784,7 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
       const t = now();
       const row: TransferRow = {
         tid,
+        uploadId: req.uploadId ?? null,
         ch,
         direction: "out",
         peer: to,
@@ -785,6 +812,12 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
         });
       } catch (e) {
         rmrf(dir);
+        if (req.uploadId) {
+          const previous = store.byUploadId(req.uploadId);
+          if (previous && previous.ch === ch && previous.peer === to && previous.name === name && previous.size === size && previous.sha256 === sha256) {
+            return toApi(previous);
+          }
+        }
         throw e;
       }
       emitRow(row);
@@ -797,6 +830,41 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
         );
       }
       return toApi(row);
+    },
+
+    async requestUpload(this: TransferService, ch: string, upload: TransferUpload) {
+      if (stopped) throw new TransferError("stopped", "transfer service is stopped");
+      if (typeof upload.name !== "string" || !upload.name.trim() || Buffer.byteLength(upload.name, "utf8") > 255) {
+        throw new TransferError("bad_request", "filename must be between 1 and 255 bytes");
+      }
+      if (typeof upload.uploadId !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(upload.uploadId)) {
+        throw new TransferError("bad_request", "invalid upload retry id");
+      }
+      const dir = join(uploadStagingDir, randomId());
+      const name = sanitizeFileName(upload.name);
+      const path = join(dir, name);
+      let handle: Awaited<ReturnType<typeof open>> | undefined;
+      let size = 0;
+      try {
+        await ensureDirAsync(dir);
+        handle = await open(path, "wx", 0o600);
+        for await (const chunk of upload.bytes) {
+          if (!(chunk instanceof Uint8Array)) throw new TransferError("bad_request", "upload contains invalid data");
+          size += chunk.byteLength;
+          if (size > maxUploadBytes) throw new TransferError("bad_request", "file exceeds the 25 MiB upload limit");
+          await handle.write(chunk);
+        }
+        await handle.close();
+        handle = undefined;
+        if (stopped) throw new TransferError("stopped", "transfer service is stopped");
+        return await this.request(ch, { path, to: upload.to, initiatedBy: "owner", uploadId: upload.uploadId });
+      } catch (e) {
+        if (e instanceof TransferError) throw e;
+        throw new TransferError("bad_request", `cannot stage uploaded file: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        await handle?.close().catch(() => {});
+        rmrf(dir);
+      }
     },
 
     approve(tid) {

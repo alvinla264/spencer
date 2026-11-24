@@ -27,6 +27,8 @@ export interface ApiBackend {
 }
 
 const MAX_BODY = 1024 * 1024;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_CONCURRENT_UPLOADS = 3;
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -91,6 +93,7 @@ function errorStatus(e: unknown): number {
   if (err?.code === "ENOENT") return 404;
   if (err?.code === "EACCES" || err?.code === "EISDIR") return 400;
   const msg = typeof err?.message === "string" ? err.message : "";
+  if (/\b(upload limit)\b/i.test(msg)) return 413;
   if (/\bnot found\b|\bunknown (channel|transfer|message)\b|\bno such\b/i.test(msg)) return 404;
   if (/\b(invalid|required|must|too (large|long|big)|not allowed|missing)\b/i.test(msg)) return 400;
   if (/\b(state|already|cannot .* in)\b/i.test(msg)) return 409;
@@ -102,6 +105,20 @@ function tokenEq(a: string | undefined, b: string): boolean {
   const x = Buffer.from(a);
   const y = Buffer.from(b);
   return x.length === y.length && timingSafeEqual(x, y);
+}
+
+async function* boundedUpload(req: IncomingMessage): AsyncGenerator<Uint8Array> {
+  let size = 0;
+  let tooLarge = false;
+  for await (const chunk of req) {
+    size += chunk.byteLength;
+    if (size > MAX_UPLOAD_BYTES) {
+      tooLarge = true;
+      continue; // Drain the request without staging more bytes so the daemon can return a useful 413.
+    }
+    yield chunk;
+  }
+  if (tooLarge) throw new Error("file exceeds the 25 MiB upload limit");
 }
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -155,6 +172,7 @@ export class ApiServer {
   private wss: WebSocketServer | undefined;
   private unsub: (() => void) | undefined;
   private _port = 0;
+  private activeUploads = 0;
 
   constructor(backend: ApiBackend) {
     this.b = backend;
@@ -364,6 +382,31 @@ export class ApiServer {
       const body = await readJson(req);
       if (typeof body.link !== "string") throw new HttpError(400, "link is required");
       return { channel: await b.acceptInvite(body.link) };
+    }
+
+    if (p === "/api/transfers/upload" && method === "POST") {
+      const ch = q.get("ch");
+      const name = q.get("name");
+      const to = q.get("to") ?? undefined;
+      const uploadId = q.get("uploadId");
+      if (!ch || !b.core.getChannel(ch)) throw new HttpError(400, "ch must be a known channel");
+      if (!uploadId || !/^[A-Za-z0-9_-]{16,64}$/.test(uploadId)) throw new HttpError(400, "uploadId must be a valid retry id");
+      if (!name?.trim() || Buffer.byteLength(name, "utf8") > 255) throw new HttpError(400, "filename must be between 1 and 255 bytes");
+      if (to !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(to)) throw new HttpError(400, "to must be an identity id");
+      if (!/^application\/octet-stream(?:\s*;|$)/i.test(req.headers["content-type"] ?? "")) {
+        throw new HttpError(415, "content-type must be application/octet-stream");
+      }
+      const contentLength = req.headers["content-length"];
+      if (contentLength !== undefined && (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_UPLOAD_BYTES)) {
+        throw new HttpError(413, "file exceeds the 25 MiB upload limit");
+      }
+      if (this.activeUploads >= MAX_CONCURRENT_UPLOADS) throw new HttpError(429, "too many active uploads; try again shortly");
+      this.activeUploads++;
+      try {
+        return await b.transfers().requestUpload(ch, { name, uploadId, bytes: boundedUpload(req), ...(to ? { to } : {}) });
+      } finally {
+        this.activeUploads--;
+      }
     }
 
     if (p === "/api/transfers") {

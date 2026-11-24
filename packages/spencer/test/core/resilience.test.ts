@@ -31,6 +31,11 @@ test("outbox: after a reconnect, messages that failed on the dead connection go 
   };
   const { A, B, ch } = await pairVia(t, proxy.url, tuning);
   try {
+    // Drain the setup hello before freezing; otherwise it can take the 30s backoff ahead of this test's chat.
+    await waitFor(
+      () => (A.daemon.db.prepare("SELECT count(*) AS n FROM outbox WHERE ch = ? AND state = 'pending'").get(ch) as { n: number }).n === 0,
+      "setup messages delivered",
+    );
     proxy.freeze();
     const m = A.daemon.sendHuman(ch, "sent into a dead socket");
     await waitFor(

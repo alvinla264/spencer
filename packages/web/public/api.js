@@ -54,6 +54,29 @@ export const api = {
   acceptInvite: (link) => request("POST", "/api/invites/accept", { link }),
   transfers: () => request("GET", "/api/transfers"),
   sendFile: (ch, path, to) => request("POST", "/api/transfers", to ? { ch, path, to } : { ch, path }),
+  uploadFile: (ch, file, to, uploadId, onProgress) => new Promise((resolve, reject) => {
+    const params = new URLSearchParams({ ch, name: file.name, uploadId });
+    if (to) params.set("to", to);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/transfers/upload?${params}`);
+    xhr.setRequestHeader("X-Spencer-Token", token);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable && e.total > 0) onProgress?.(e.loaded / e.total);
+    });
+    xhr.addEventListener("load", () => {
+      let data;
+      try { data = JSON.parse(xhr.responseText); } catch { data = null; }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress?.(1);
+        resolve(data ?? {});
+      }
+      else reject(new ApiError(data && typeof data.error === "string" ? data.error : `${xhr.status} ${xhr.statusText}`, xhr.status));
+    });
+    xhr.addEventListener("error", () => reject(new ApiError("Can't reach Spencer. Is the daemon running?", 0)));
+    xhr.addEventListener("abort", () => reject(new ApiError("Upload was cancelled", 0)));
+    xhr.send(file);
+  }),
   transferAction: (tid, action) => request("POST", `/api/transfers/${enc(tid)}/${action}`),
   mcp: () => request("GET", "/api/mcp"),
   cancelFollowup: (id) => request("POST", `/api/followups/${enc(id)}/cancel`),

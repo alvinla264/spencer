@@ -8,6 +8,8 @@ import { transferCard } from "./transfers.js";
 import { openModal, field } from "./modal.js";
 import { scrollKeeper } from "./scroll.js";
 import { navigate } from "./router.js";
+import { hasDraftFile, uploadDraftBatch } from "./draft-batch.js";
+import { discardEmptyChannelDraftState, getChannelDraftState } from "./draft-state.js";
 
 const NOTE_LABEL = {
   "not addressed": "Your Spencer stayed quiet: it was not addressed.",
@@ -21,6 +23,21 @@ const NOTE_LABEL = {
 };
 /** Consecutive turns by the same speaker within this window share one header. */
 const GROUP_MS = 5 * 60_000;
+const MAX_DRAFT_FILES = 10;
+const MAX_DRAFT_BYTES = 50 * 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const attachmentDraftsByChannel = new Map();
+
+function hasDraggedFiles(e) {
+  return Array.from(e.dataTransfer?.types ?? []).includes("Files");
+}
+
+// A file dropped anywhere in the document must never be interpreted by the browser as navigation.
+for (const type of ["dragover", "drop"]) {
+  document.addEventListener(type, (e) => {
+    if (hasDraggedFiles(e)) e.preventDefault();
+  }, true);
+}
 
 // ---------------------------------------------------------------- message rendering
 
@@ -135,7 +152,7 @@ function messageRow(c, m, byId, names, myNames, cont, hideRef) {
 
 // ---------------------------------------------------------------- mention completion
 
-function mentionCompleter(input, getChannel) {
+function mentionCompleter(input, getChannel, onChange) {
   const list = h("ul.mention-list", { role: "listbox", hidden: true, "aria-label": "Mention a member" });
   let state = null; // {start, items, idx}
 
@@ -157,6 +174,7 @@ function mentionCompleter(input, getChannel) {
     input.setSelectionRange(pos, pos);
     close();
     autoGrow(input);
+    onChange?.(input.value);
     input.focus();
   };
 
@@ -516,22 +534,169 @@ export function channelView(main, chId) {
 
   const send = async (text) => {
     const c = getC();
-    if (!c) return false;
-    const res = await attempt(() => api.channelSend(c.id, text, mentionIds(c, text)));
-    if (res) keeper.toBottom();
-    return !!res;
+    if (!c || c.id !== chId) return false;
+    const hasAttachments = drafts.some((d) => d.status !== "sent");
+    const recipient = hasAttachments && c.kind === "group" ? (draftState.recipient ?? recipientSelect?.value) : undefined;
+    if (hasAttachments && c.kind === "group" && !recipient) {
+      toast("Choose who gets the files");
+      recipientSelect?.focus();
+      return false;
+    }
+    draftState.sending = true;
+    renderDrafts();
+    try {
+      if (hasAttachments) {
+        const batchOk = await uploadDraftBatch(drafts, {
+          isPresent: (draft) => draftState.drafts.includes(draft),
+          onUpdate: () => renderDrafts(),
+          upload: async (draft) => {
+            if (c.kind === "group") {
+              draftState.recipient = recipient;
+              draftState.recipientLocked = true;
+            }
+            draft.status = "uploading";
+            draft.progress = 0;
+            renderDrafts();
+            return api.uploadFile(c.id, draft.file, recipient, draft.uploadId, (fraction) => {
+              const progress = Math.floor(fraction * 10) * 10;
+              if (progress !== draft.progress) {
+                draft.progress = progress;
+                renderDrafts();
+              }
+            });
+          },
+          onSuccess: (draft, transfer) => {
+            draft.status = "sent";
+            draft.error = "";
+            draft.transfer = transfer;
+            upsertTransfer(transfer);
+            renderDrafts();
+          },
+          onFailure: (draft, error) => {
+            draft.status = "failed";
+            draft.error = error instanceof Error ? error.message : String(error);
+            renderDrafts();
+            toast(`Could not send ${draft.file.name}: ${draft.error}`);
+          },
+        });
+        if (!batchOk) return false;
+        for (let i = drafts.length - 1; i >= 0; i--) if (drafts[i].status === "sent") drafts.splice(i, 1);
+        if (!drafts.length) {
+          draftState.recipient = null;
+          draftState.recipientLocked = false;
+        }
+        renderDrafts();
+        comp.sync();
+      }
+      if (!text) return true;
+      const res = await attempt(() => api.channelSend(c.id, text, mentionIds(c, text)));
+      if (res) {
+        draftState.messageText = "";
+        keeper.toBottom();
+      }
+      return !!res;
+    } finally {
+      draftState.sending = false;
+      renderDrafts();
+      discardEmptyChannelDraftState(attachmentDraftsByChannel, chId, draftState);
+    }
   };
   const completerHolder = { onKey: () => false };
   const fileBtn = h("button.icon-btn.attach", { type: "button", "aria-label": "Send file", title: "Send file", on: { click: () => getC() && sendFileModal(getC()) } }, icon("paperclip", 18));
+  const draftBox = h("div.draft-attachments", { hidden: true, "aria-live": "polite" });
+  const draftState = getChannelDraftState(attachmentDraftsByChannel, chId);
+  const drafts = draftState.drafts;
+  const cAtCreation = getC();
+  const ps = cAtCreation ? peers(cAtCreation) : [];
+  const recipientSelect = cAtCreation?.kind === "group" ? h(
+    "select.draft-recipient.input",
+    { "aria-label": "Choose who gets the attached files" },
+    h("option", { value: "" }, "Choose a member…"),
+    ps.map((m) => h("option", { value: m.id }, `${m.name || m.id.slice(0, 8)} (${shortFp(m.fingerprint)})`)),
+  ) : null;
+  if (recipientSelect) {
+    recipientSelect.value = draftState.recipient ?? "";
+    recipientSelect.addEventListener("change", () => {
+      if (!draftState.recipientLocked) draftState.recipient = recipientSelect.value || null;
+    });
+  }
+  const drawDrafts = () => {
+    draftBox.hidden = drafts.length === 0;
+    if (recipientSelect) recipientSelect.disabled = draftState.recipientLocked;
+    const nodes = drafts.map((d) => h("div.draft-attachment", null,
+      icon("file", 16),
+      h("span.draft-name", { title: d.file.name }, d.file.name),
+      h("span.draft-state", { title: d.error || "" }, d.status === "uploading" ? `Uploading ${d.progress ?? 0}%` : d.status === "queued" ? "Waiting to upload" : d.status === "failed" ? "Failed · Send to retry" : d.status === "sent" ? (d.transfer?.state === "awaiting_approval" ? "Waiting for approval" : "Offered") : "Ready to send"),
+      h("button.draft-remove", { type: "button", "aria-label": `Remove ${d.file.name}`, disabled: d.status === "uploading", on: { click: () => { const i = drafts.indexOf(d); if (i >= 0) drafts.splice(i, 1); if (!drafts.length) { draftState.recipient = null; draftState.recipientLocked = false; } renderDrafts(); } } }, "×"),
+    ));
+    if (recipientSelect) nodes.push(recipientSelect);
+    draftBox.replaceChildren(...nodes);
+  };
+  const renderDrafts = () => {
+    for (const render of draftState.renderers) render();
+  };
   const comp = composer({
     placeholder: "Write as yourself…",
     label: "Message as yourself",
     hint: ["You write here as a person; your Spencer answers on its own. ", h("kbd", null, "@"), " mentions. ", SEND_HINT()],
     left: fileBtn,
+    drafts: draftBox,
+    canSend: () => drafts.length > 0,
+    initialText: draftState.messageText,
+    onTextChange: (value) => { draftState.messageText = value; renderDrafts(); },
+    isBusy: () => draftState.sending,
     onKey: (e) => completerHolder.onKey(e),
     onSend: send,
   });
-  const completer = mentionCompleter(comp.input, getC);
+  const renderDraftsForView = () => {
+    if (!draftState.sending && document.activeElement !== comp.input && comp.input.value !== draftState.messageText) comp.input.value = draftState.messageText;
+    drawDrafts();
+    comp.sync();
+  };
+  draftState.renderers.add(renderDraftsForView);
+  renderDrafts();
+  const addDroppedFiles = (e) => {
+    if (!hasDraggedFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const items = Array.from(e.dataTransfer.items ?? []);
+    let folderDropped = false;
+    const files = [];
+    if (items.length) {
+      for (const item of items) {
+        if (item.kind !== "file") continue;
+        const entry = item.webkitGetAsEntry?.();
+        if (entry?.isDirectory) { folderDropped = true; continue; }
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    } else files.push(...Array.from(e.dataTransfer.files ?? []));
+    if (folderDropped) toast("Folders can’t be attached; drop regular files instead");
+    let total = drafts.reduce((n, d) => n + d.file.size, 0);
+    for (const file of files) {
+      if (!file.name || file.size > MAX_FILE_BYTES) { toast(`${file.name || "File"} exceeds the 25 MiB limit`); continue; }
+      if (new TextEncoder().encode(file.name).length > 255) { toast("File names must be 255 bytes or shorter"); continue; }
+      if (hasDraftFile(drafts, file)) continue;
+      if (drafts.length >= MAX_DRAFT_FILES || total + file.size > MAX_DRAFT_BYTES) { toast("The composer allows up to 10 files and 50 MiB at a time"); break; }
+      drafts.push({ file, uploadId: crypto.randomUUID(), status: "draft", progress: 0, error: "" });
+      total += file.size;
+    }
+    renderDrafts();
+    comp.sync();
+  };
+  comp.form.addEventListener("dragover", (e) => {
+    if (!hasDraggedFiles(e)) return;
+    e.preventDefault();
+    comp.form.classList.add("file-drop-target");
+  });
+  comp.form.addEventListener("dragleave", (e) => {
+    if (!comp.form.contains(e.relatedTarget)) comp.form.classList.remove("file-drop-target");
+  });
+  comp.form.addEventListener("drop", (e) => {
+    comp.form.classList.remove("file-drop-target");
+    addDroppedFiles(e);
+  });
+  const completer = mentionCompleter(comp.input, getC, (value) => { draftState.messageText = value; renderDrafts(); });
   completerHolder.onKey = completer.onKey;
   comp.input.setAttribute("aria-autocomplete", "list");
   comp.form.prepend(completer.el);
@@ -800,6 +965,8 @@ export function channelView(main, chId) {
   return {
     destroy: () => {
       clearInterval(staleTimer);
+      draftState.renderers.delete(renderDraftsForView);
+      discardEmptyChannelDraftState(attachmentDraftsByChannel, chId, draftState);
       offs.forEach((f) => f());
       document.removeEventListener("visibilitychange", onVisible);
       document.removeEventListener("keydown", onKey);
