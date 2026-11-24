@@ -450,7 +450,8 @@ that, `schedule_followup` fails and tells the model to report what it has (or as
 |---|---|---|
 | GET | `/api/state` | → `{me:{id, name, fingerprint}, relay:{url, connected}, relays: RelayStatus[], channels: Channel[], transfers: Transfer[], mcp: McpServer[], policy, p2p: {mode, available, error?}, ownerBusy: boolean, requests: OwnerRequest[], followups: Followup[]}`. `relay` is the default relay from config; `connected` is true when every relay in use is connected. `relays` lists each relay in use (one per distinct channel relay, plus the default). |
 | GET | `/api/owner/messages?limit=` | → `{items: OwnerItem[]}` (owner conversation transcript, oldest first; default 200, max 2000) |
-| POST | `/api/owner/messages` | `{text}` → `{submissionId}` |
+| POST | `/api/owner/attachments/upload?name=&uploadId=` | `application/octet-stream` body → `{id, name, size}` (stages a private owner attachment; `uploadId` makes retries idempotent) |
+| POST | `/api/owner/messages` | `{text?, attachments?: string[], requestId?}` → `{submissionId}` (requires text or at least one staged attachment; `requestId` makes retries idempotent) |
 | GET | `/api/channels` | → `{items: Channel[]}` |
 | GET | `/api/channels/:ch` | → `Channel` |
 | GET | `/api/channels/:ch/messages?limit=&before=` | → `{items: ChannelMessage[]}`: chat and hello messages, oldest first, default 100, max 1000. `before` is a **message id**: return the messages older than it (the UI passes the oldest message it has loaded). An unknown id → 404. Without `before`, the channel is marked read. |
@@ -476,6 +477,8 @@ that, `schedule_followup` fails and tells the model to report what it has (or as
 | POST | `/api/auth/github-copilot/logout` | → `ModelStatus` (forgets the saved sign-in) |
 | POST | `/api/auth/github-copilot/cli` | `{login}` → `ModelStatus`: reuse the GitHub Copilot CLI's saved sign-in for that login (`$COPILOT_HOME` or `~/.copilot/config.json`); 400 if there is none or it has no Copilot |
 | WS | `/api/events?token=` | server → client events: `{type:"channel", channel}`, `{type:"channel_removed", ch}` (left the channel), `{type:"message", ch, message}`, `{type:"transfer", transfer}`, `{type:"owner", item}`, `{type:"relay", ...RelayStatus}` (any change of a relay connection's state), `{type:"presence", ch, id, presence, lastSeen?}` (a member's Spencer came online or went offline in channel `ch`; when *our* connection to a relay goes up or down, each of its channels is re-sent as a `channel` event instead, since every member's presence changes), `{type:"owner_busy", busy}`, `{type:"mcp", servers: McpServer[]}`, `{type:"request", request: OwnerRequest}`, `{type:"followup", followup: Followup}` (created or changed), `{type:"model", model: ModelStatus}` (model, sign-in or GitHub CLI accounts changed), `{type:"status", ch, from, replyTo, state, activity?, ts}` (progress of a Spencer, possibly mine, on message `replyTo`; `state` as in §3.1, including the task states) |
+
+Owner attachments are local-only files, not channel transfers. Each file can be at most 25 MiB. One owner message can attach at most 10 files and 50 MiB total. The private store holds at most 500 MiB. It removes files older than 30 days at startup and before uploads. The UI stages files on drop and uploads only after Send.
 
 ```ts
 interface ModelProviderOption { id: string; name: string; defaultApiKeyEnv?: string;
@@ -516,8 +519,10 @@ interface Transfer { via?: "link"|"croc"; tid: string; ch: string; direction: "o
   reason?: string;     // free text from whoever initiated it, e.g. the peer agent's justification
   progress?: number;   // fraction 0–1 while sending/receiving, 1 once completed; absent before croc reports any
   error?: string; path?: string; createdAt: number; updatedAt: number; expiresAt: number }
+interface OwnerAttachment { id: string; name: string; size: number }
 interface OwnerItem { id: string; role: "user"|"assistant"|"tool"|"note"; text: string; ts: number;
   toolName?: string; isError?: boolean;
+  attachments?: OwnerAttachment[]; // files attached to this owner message; never a peer transfer
   untrusted?: boolean;    // text written by another person's agent (e.g. a reply to something the owner sent)
   request?: string }      // an ask_owner request card: the OwnerRequest id
 interface ChannelMember { features?: string[]; id: string; name?: string; fingerprint: string; me: boolean;

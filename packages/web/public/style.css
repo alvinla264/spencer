@@ -1628,10 +1628,33 @@ details[open] > summary > .icon:last-child,
   border-color: var(--accent);
   background: var(--accent-soft);
 }
+.owner-pending-send:not([hidden]) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 8px;
+  padding: 9px 11px;
+  background: var(--accent-soft);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.owner-pending-send > span {
+  min-width: 0;
+}
 .draft-attachments:not([hidden]) {
   display: grid;
   gap: 6px;
   margin: 0 0 8px;
+  padding: 9px 11px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.turn-attachments {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
   padding: 9px 11px;
   background: var(--surface);
   border: 1px solid var(--line);

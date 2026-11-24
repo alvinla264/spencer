@@ -44,7 +44,28 @@ const enc = encodeURIComponent;
 export const api = {
   state: () => request("GET", "/api/state"),
   ownerMessages: (limit = 200) => request("GET", `/api/owner/messages?limit=${limit}`),
-  ownerSend: (text) => request("POST", "/api/owner/messages", { text }),
+  ownerSend: (text, attachments = [], requestId) => request("POST", "/api/owner/messages", { text, attachments, ...(requestId ? { requestId } : {}) }),
+  uploadOwnerFile: (file, uploadId, onProgress) => new Promise((resolve, reject) => {
+    const params = new URLSearchParams({ name: file.name, uploadId });
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/owner/attachments/upload?${params}`);
+    xhr.setRequestHeader("X-Spencer-Token", token);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable && e.total > 0) onProgress?.(e.loaded / e.total);
+    });
+    xhr.addEventListener("load", () => {
+      let data;
+      try { data = JSON.parse(xhr.responseText); } catch { data = null; }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress?.(1);
+        resolve(data ?? {});
+      } else reject(new ApiError(data && typeof data.error === "string" ? data.error : `${xhr.status} ${xhr.statusText}`, xhr.status));
+    });
+    xhr.addEventListener("error", () => reject(new ApiError("Can't reach Spencer. Is the daemon running?", 0)));
+    xhr.addEventListener("abort", () => reject(new ApiError("Upload was cancelled", 0)));
+    xhr.send(file);
+  }),
   channelMessages: (ch, limit = 100, before) =>
     request("GET", `/api/channels/${enc(ch)}/messages?limit=${limit}${before !== undefined ? `&before=${enc(before)}` : ""}`),
   channelSend: (ch, text, mentions) => request("POST", `/api/channels/${enc(ch)}/messages`, mentions?.length ? { text, mentions } : { text }),

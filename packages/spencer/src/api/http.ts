@@ -1,10 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, resolve, sep } from "node:path";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { AgentService, Channel, ChannelMessage, CoreServices, TransferService } from "../contracts.ts";
+import type { AgentService, Channel, ChannelMessage, CoreServices, OwnerAttachment, TransferService } from "../contracts.ts";
+import { OWNER_ATTACHMENT_MAX_FILES, OwnerAttachmentStore } from "./owner-attachments.ts";
 import type { EventBus } from "../events.ts";
 import { UserError } from "../channels.ts";
 import { RelayError } from "../net/relay-client.ts";
@@ -17,6 +18,7 @@ export interface ApiBackend {
   core: CoreServices;
   agent(): AgentService;
   transfers(): TransferService;
+  ownerAttachments: OwnerAttachmentStore;
   state(): unknown;
   channelMessages(ch: string, limit: number, before?: string): ChannelMessage[];
   updateChannel(ch: string, patch: Record<string, unknown>): Channel;
@@ -202,6 +204,7 @@ export class ApiServer {
   }
 
   async listen(port: number): Promise<number> {
+    await this.b.ownerAttachments.initialize();
     const server = createServer((req, res) => {
       this.handle(req, res).catch((e: Error) => {
         this.b.log(`http: ${e.stack ?? e.message}`);
@@ -312,13 +315,54 @@ export class ApiServer {
 
     if (p === "/api/state" && method === "GET") return b.state();
 
+    if (p === "/api/owner/attachments/upload" && method === "POST") {
+      const name = q.get("name");
+      const uploadId = q.get("uploadId");
+      if (!uploadId || !/^[A-Za-z0-9_-]{16,64}$/.test(uploadId)) throw new HttpError(400, "uploadId must be a valid retry id");
+      if (!name?.trim() || Buffer.byteLength(name, "utf8") > 255) throw new HttpError(400, "filename must be between 1 and 255 bytes");
+      if (!/^application\/octet-stream(?:\s*;|$)/i.test(req.headers["content-type"] ?? "")) throw new HttpError(415, "content-type must be application/octet-stream");
+      const contentLength = req.headers["content-length"];
+      if (contentLength !== undefined && (!/^\d+$/.test(contentLength) || Number(contentLength) > MAX_UPLOAD_BYTES)) throw new HttpError(413, "file exceeds the 25 MiB upload limit");
+      if (this.activeUploads >= MAX_CONCURRENT_UPLOADS) throw new HttpError(429, "too many active uploads; try again shortly");
+      this.activeUploads++;
+      try {
+        const attachment = await b.ownerAttachments.upload(name, uploadId, boundedUpload(req));
+        return { id: attachment.id, name: attachment.name, size: attachment.size };
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("private attachment storage is full")) throw new HttpError(507, error.message);
+        throw error;
+      } finally {
+        this.activeUploads--;
+      }
+    }
+
     if (p === "/api/owner/messages") {
       if (method === "GET") return { items: await b.agent().ownerTranscript(intParam(q.get("limit"), 200, 2000)) };
       if (method === "POST") {
         const body = await readJson(req);
-        if (typeof body.text !== "string" || !body.text.trim()) throw new HttpError(400, "text is required");
-        if (body.text.length > 100_000) throw new HttpError(400, "text too long");
-        return await b.agent().ownerSend(body.text);
+        const text = typeof body.text === "string" ? body.text : "";
+        const ids = body.attachments ?? [];
+        if (text.length > 100_000) throw new HttpError(400, "text too long");
+        if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string") || (ids.length === 0 && !text.trim())) throw new HttpError(400, "text or attachments are required");
+        if (ids.length > OWNER_ATTACHMENT_MAX_FILES || new Set(ids).size !== ids.length) throw new HttpError(400, "invalid attachments list");
+        const requestId = typeof body.requestId === "string" ? body.requestId : randomUUID();
+        if (!/^[A-Za-z0-9_-]{16,64}$/.test(requestId)) throw new HttpError(400, "requestId must be a valid retry id");
+        const fingerprint = createHash("sha256").update(JSON.stringify([text, ids])).digest("hex");
+        try {
+          const previous = b.ownerAttachments.findOwnerSend(requestId, fingerprint);
+          if (previous) return { submissionId: previous };
+        } catch (error) {
+          throw new HttpError(409, error instanceof Error ? error.message : String(error));
+        }
+        let attachments: (OwnerAttachment & { path: string })[];
+        try {
+          attachments = b.ownerAttachments.get(ids as string[]);
+        } catch (error) {
+          throw new HttpError(400, error instanceof Error ? error.message : String(error));
+        }
+        const result = await b.agent().ownerSend(text, { requestId, attachments });
+        b.ownerAttachments.recordOwnerSend(requestId, fingerprint, result.submissionId);
+        return result;
       }
     }
 

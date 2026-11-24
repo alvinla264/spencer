@@ -1,12 +1,24 @@
 // The owner's own conversation with their Spencer.
 import { h, icon, linkify, timeShort, timeFull, selfAvatar } from "./dom.js";
-import { api, attempt } from "./api.js";
+import { api, attempt, toast } from "./api.js";
 import { S, on, setOwner } from "./state.js";
 import { hashFor } from "./router.js";
 import { viewHeader, composer, SEND_HINT, stage, skeleton, trace, mark, activityNode, followupList } from "./common.js";
 import { markdown } from "./md.js";
 import { scrollKeeper } from "./scroll.js";
 import { requestCard } from "./requests.js";
+import { hasDraftFile, uploadDraftBatch } from "./draft-batch.js";
+
+const MAX_DRAFT_FILES = 10;
+const MAX_DRAFT_BYTES = 50 * 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const ownerDraftState = { drafts: [], messageText: "", sending: false, sendId: null, sendKey: null, pendingSend: null, renderers: new Set() };
+
+for (const type of ["dragover", "drop"]) {
+  document.addEventListener(type, (event) => {
+    if (Array.from(event.dataTransfer?.types ?? []).includes("Files")) event.preventDefault();
+  }, true);
+}
 
 const EXAMPLES = ["List my peers", "Ask Bob's Spencer for the logs", "What transfers are waiting for me?", "Create an invite for Carol"];
 
@@ -119,7 +131,11 @@ function stepsBlock(items, running) {
 function ownerItem(item) {
   switch (item.role) {
     case "user":
-      return h("div.turn.user", null, h("div.turn-text", null, linkify(item.text)), h("div.turn-meta", null, timeEl(item.ts)));
+      return h("div.turn.user", null,
+        item.text ? h("div.turn-text", null, linkify(item.text)) : null,
+        item.attachments?.length ? h("div.turn-attachments", { "aria-label": "Attachments" }, item.attachments.map((file) => h("div.draft-attachment", null, icon("file", 16), h("span.draft-name", { title: file.name }, file.name)))) : null,
+        h("div.turn-meta", null, timeEl(item.ts)),
+      );
     case "assistant":
       return h(
         "div.turn.agent",
@@ -143,12 +159,148 @@ export function ownerView(main) {
   const keeper = scrollKeeper(scroller);
   const st = stage(scroller, keeper);
 
-  const send = async (text) => {
-    const res = await attempt(() => api.ownerSend(text));
-    if (res) keeper.toBottom();
-    return !!res;
+  const drafts = ownerDraftState.drafts;
+  const draftBox = h("div.draft-attachments", { hidden: true, "aria-live": "polite" });
+  const retryPendingButton = h("button.btn.sm", { type: "button", on: { click: () => retryPending() } }, "Retry previous send");
+  const pendingNotice = h("div.owner-pending-send", { hidden: true, role: "status" }, h("span", null, "Send outcome unknown. Retry the previous send before sending new text."), retryPendingButton);
+  const draftArea = h("div.owner-composer-drafts", null, pendingNotice, draftBox);
+  let comp;
+  const drawDrafts = () => {
+    draftBox.hidden = drafts.length === 0;
+    pendingNotice.hidden = !ownerDraftState.pendingSend;
+    retryPendingButton.disabled = ownerDraftState.sending;
+    draftBox.replaceChildren(...drafts.map((draft) => h("div.draft-attachment", null,
+      icon("file", 16),
+      h("span.draft-name", { title: draft.file.name }, draft.file.name),
+      h("span.draft-state", { title: draft.error || "" }, ownerDraftState.pendingSend?.uploadIds.includes(draft.uploadId) ? "Send status unknown · retry" : draft.status === "uploading" ? `Uploading ${draft.progress ?? 0}%` : draft.status === "failed" ? "Failed · Send to retry" : draft.status === "sent" ? "Ready to send" : "Ready"),
+      h("button.draft-remove", { type: "button", "aria-label": `Remove ${draft.file.name}`, disabled: ownerDraftState.sending || ownerDraftState.pendingSend?.uploadIds.includes(draft.uploadId) || draft.status === "uploading" || draft.status === "queued", on: { click: () => { drafts.splice(drafts.indexOf(draft), 1); renderDrafts(); } } }, "×"),
+    )));
+    comp?.sync();
   };
-  const comp = composer({ placeholder: "Message Spencer…", label: "Message Spencer", hint: SEND_HINT(), onSend: send });
+  const renderDraftsForView = () => {
+    drawDrafts();
+    if (comp && document.activeElement !== comp.input && !ownerDraftState.sending) comp.input.value = ownerDraftState.messageText;
+  };
+  const renderDrafts = () => { for (const render of ownerDraftState.renderers) render(); };
+  const send = async (text, preserveText = null) => {
+    if (ownerDraftState.sending) return false;
+    const pending = ownerDraftState.pendingSend;
+    if (pending && text !== pending.text && preserveText === null) {
+      toast("A previous send’s outcome is unknown. Retry it before sending this draft.");
+      return false;
+    }
+    const batchDrafts = pending
+      ? drafts.filter((draft) => pending.uploadIds.includes(draft.uploadId))
+      : drafts.slice();
+    const requestText = pending?.text ?? text;
+    const hasAttachments = batchDrafts.length > 0;
+    const key = JSON.stringify([requestText, batchDrafts.map((draft) => draft.uploadId)]);
+    if (!pending && key !== ownerDraftState.sendKey) {
+      ownerDraftState.sendKey = key;
+      ownerDraftState.sendId = crypto.randomUUID();
+    }
+    ownerDraftState.sending = true;
+    renderDrafts();
+    try {
+      if (hasAttachments) {
+        const uploaded = await uploadDraftBatch(batchDrafts, {
+          isPresent: (draft) => drafts.includes(draft),
+          onUpdate: renderDrafts,
+          upload: async (draft) => {
+            draft.status = "uploading";
+            draft.progress = 0;
+            renderDrafts();
+            return api.uploadOwnerFile(draft.file, draft.uploadId, (fraction) => {
+              const progress = Math.floor(fraction * 10) * 10;
+              if (progress !== draft.progress) { draft.progress = progress; renderDrafts(); }
+            });
+          },
+          onSuccess: (draft, attachment) => { draft.status = "sent"; draft.error = ""; draft.attachment = attachment; renderDrafts(); },
+          onFailure: (draft, error) => { draft.status = "failed"; draft.error = error instanceof Error ? error.message : String(error); renderDrafts(); toast(`Could not upload ${draft.file.name}: ${draft.error}`); },
+        });
+        if (!uploaded) return false;
+      }
+      const files = batchDrafts.filter((draft) => draft.status === "sent").map((draft) => draft.attachment.id);
+      const request = pending ?? { requestId: ownerDraftState.sendId, text: requestText, uploadIds: batchDrafts.map((draft) => draft.uploadId) };
+      ownerDraftState.pendingSend = request;
+      let res;
+      try {
+        res = await api.ownerSend(request.text, files, request.requestId);
+      } catch (error) {
+        toast(error instanceof Error ? error.message : String(error));
+        const status = Number(error?.status);
+        if (!pending && status >= 400 && status < 500) {
+          // A definitive client rejection was not accepted; let the owner correct this draft.
+          ownerDraftState.pendingSend = null;
+          ownerDraftState.sendId = null;
+          ownerDraftState.sendKey = null;
+        }
+        return false;
+      }
+      if (!res) return false;
+      for (const draft of batchDrafts) {
+        const index = drafts.indexOf(draft);
+        if (index >= 0) drafts.splice(index, 1);
+      }
+      ownerDraftState.pendingSend = null;
+      ownerDraftState.sendId = null;
+      ownerDraftState.sendKey = null;
+      ownerDraftState.messageText = pending && preserveText !== null && preserveText !== request.text ? preserveText : "";
+      if (comp) comp.input.value = ownerDraftState.messageText;
+      keeper.toBottom();
+      return true;
+    } finally {
+      ownerDraftState.sending = false;
+      renderDrafts();
+    }
+  };
+  async function retryPending() {
+    const pending = ownerDraftState.pendingSend;
+    if (!pending || ownerDraftState.sending) return;
+    await send(pending.text, ownerDraftState.messageText);
+  }
+
+  comp = composer({
+    placeholder: "Message Spencer…", label: "Message Spencer", hint: SEND_HINT(), drafts: draftArea,
+    canSend: () => drafts.length > 0, isBusy: () => ownerDraftState.sending,
+    initialText: ownerDraftState.messageText,
+    onTextChange: (text) => { ownerDraftState.messageText = text; },
+    onSend: send,
+  });
+  const addDroppedFiles = (event) => {
+    if (!Array.from(event.dataTransfer?.types ?? []).includes("Files")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const files = [];
+    let folderDropped = false;
+    const items = Array.from(event.dataTransfer.items ?? []);
+    if (items.length) {
+      for (const item of items) {
+        if (item.kind !== "file") continue;
+        if (item.webkitGetAsEntry?.()?.isDirectory) { folderDropped = true; continue; }
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    } else files.push(...Array.from(event.dataTransfer.files ?? []));
+    if (folderDropped) toast("Folders can’t be attached; drop regular files instead");
+    let total = drafts.reduce((sum, draft) => sum + draft.file.size, 0);
+    for (const file of files) {
+      if (!file.name || file.size > MAX_FILE_BYTES) { toast(`${file.name || "File"} exceeds the 25 MiB limit`); continue; }
+      if (new TextEncoder().encode(file.name).length > 255) { toast("File names must be 255 bytes or shorter"); continue; }
+      if (hasDraftFile(drafts, file)) continue;
+      if (drafts.length >= MAX_DRAFT_FILES || total + file.size > MAX_DRAFT_BYTES) { toast("The composer allows up to 10 files and 50 MiB at a time"); break; }
+      drafts.push({ file, uploadId: crypto.randomUUID(), status: "draft", progress: 0, error: "" });
+      total += file.size;
+    }
+    renderDrafts();
+  };
+  comp.form.addEventListener("dragover", (event) => {
+    if (Array.from(event.dataTransfer?.types ?? []).includes("Files")) { event.preventDefault(); comp.form.classList.add("file-drop-target"); }
+  });
+  comp.form.addEventListener("dragleave", (event) => { if (!comp.form.contains(event.relatedTarget)) comp.form.classList.remove("file-drop-target"); });
+  comp.form.addEventListener("drop", (event) => { comp.form.classList.remove("file-drop-target"); addDroppedFiles(event); });
+  ownerDraftState.renderers.add(renderDraftsForView);
+  renderDrafts();
 
   const headMark = h("span.header-mark");
   const sub = h("span.subtitle");
@@ -252,5 +404,5 @@ export function ownerView(main) {
   });
 
   const offs = [on("owner", () => (render(), renderBusy())), on("busy", () => (render(), renderBusy())), on("followups", renderLater), on("model", renderLater)];
-  return { destroy: () => offs.forEach((f) => f()) };
+  return { destroy: () => { ownerDraftState.renderers.delete(renderDraftsForView); offs.forEach((f) => f()); } };
 }

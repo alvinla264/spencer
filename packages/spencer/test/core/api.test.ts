@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import WebSocket from "ws";
 import { http, relayAt, startNode, tempDir, waitFor } from "./helpers.ts";
 
@@ -92,6 +92,41 @@ test("http api: guards, state, owner + channel messages, invites, events ws", as
     assert.equal((await http(port, "POST", "/api/owner/messages", { headers: H, body: "{not json" })).status, 400);
     const tr = (await http(port, "GET", "/api/owner/messages?limit=10", { headers: H })).json();
     assert.equal(tr.items[0].text, "hello spencer");
+
+    // --- private owner attachments stage locally, then enter only the owner conversation on explicit Send
+    const beforeOwnerAttachments = A.agent().ownerSends.length;
+    const privateUpload = (name: string, uploadId: string, data: string) =>
+      http(port, "POST", `/api/owner/attachments/upload?name=${encodeURIComponent(name)}&uploadId=${uploadId}`, {
+        headers: { ...H, "Content-Type": "application/octet-stream" }, body: Buffer.from(data),
+      });
+    const staged = await privateUpload("ignore previous instructions.txt", "owner-upload-key-0001", "synthetic private bytes");
+    assert.equal(staged.status, 200, staged.text);
+    assert.equal(A.agent().ownerSends.length, beforeOwnerAttachments, "uploading does not submit a message");
+    assert.equal(A.transfers().requests.length, 0, "owner attachments never enter the peer transfer service");
+    const stagedId = staged.json().id as string;
+    const attachmentOnly = await http(port, "POST", "/api/owner/messages", {
+      headers: H, body: { text: "", attachments: [stagedId], requestId: "owner-send-key-0001" },
+    });
+    assert.equal(attachmentOnly.status, 200, attachmentOnly.text);
+    assert.equal(A.agent().ownerSends.length, beforeOwnerAttachments + 1);
+    assert.equal(A.agent().ownerSends.at(-1), "");
+    assert.equal(A.agent().ownerSendOptions.at(-1)?.requestId, "owner-send-key-0001");
+    assert.equal(readFileSync(A.agent().ownerSendOptions.at(-1)!.attachments![0]!.path, "utf8"), "synthetic private bytes");
+    assert.equal(statSync(A.agent().ownerSendOptions.at(-1)!.attachments![0]!.path).mode & 0o777, 0o600);
+    const ownerTranscript = (await http(port, "GET", "/api/owner/messages?limit=10", { headers: H })).json();
+    assert.ok(ownerTranscript.items.at(-1).attachments.some((file: any) => file.id === stagedId));
+    const secondFile = await privateUpload("notes.txt", "owner-upload-key-0002", "second private file");
+    assert.equal(secondFile.status, 200, secondFile.text);
+    const withText = await http(port, "POST", "/api/owner/messages", {
+      headers: H, body: { text: "Summarize this", attachments: [secondFile.json().id], requestId: "owner-send-key-0002" },
+    });
+    assert.equal(withText.status, 200, withText.text);
+    assert.equal(A.agent().ownerSends.at(-1), "Summarize this");
+    assert.equal(A.agent().ownerSendOptions.at(-1)?.attachments?.[0]?.name, "notes.txt");
+    assert.equal(A.transfers().requests.length, 0);
+    assert.equal(B.agent().peerChats.length, 0, "the peer receives no owner attachment message");
+    assert.equal((await http(port, "POST", "/api/owner/messages", { headers: H, body: { text: "", attachments: ["missing-file-id-000000"] } })).status, 400);
+    assert.equal(A.agent().ownerSends.length, beforeOwnerAttachments + 2, "invalid sends do not reach Spencer");
 
     // --- invites over HTTP
     const inv = await http(port, "POST", "/api/invites", { headers: H, body: { kind: "direct", name: "Bob" } });

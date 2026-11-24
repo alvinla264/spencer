@@ -36,7 +36,7 @@ import {
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import type { OwnerItem } from "../contracts.ts";
+import type { OwnerAttachment, OwnerItem } from "../contracts.ts";
 
 // ------------------------------------------------------------------ public surface
 
@@ -500,7 +500,17 @@ function entryItems(e: EntryRecord): OwnerItem[] {
     case "pi.reset":
       return [];
     case "pi.user":
-      return [{ id, role: "user", text: contentText(msg?.content), ts }];
+    case "spencer.owner-input": {
+      const data = (e.data ?? {}) as { text?: unknown; attachments?: unknown };
+      const item: OwnerItem = { id, role: "user", text: typeof data.text === "string" ? data.text : contentText(msg?.content), ts };
+      if (Array.isArray(data.attachments)) {
+        item.attachments = data.attachments.filter((file): file is OwnerAttachment =>
+          !!file && typeof file === "object" && typeof (file as OwnerAttachment).id === "string" &&
+          typeof (file as OwnerAttachment).name === "string" && Number.isSafeInteger((file as OwnerAttachment).size),
+        );
+      }
+      return [item];
+    }
     case "pi.assistant": {
       if (!msg || msg.role !== "assistant") return [];
       const am = msg as AssistantMessage;

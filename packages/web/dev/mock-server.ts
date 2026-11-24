@@ -14,7 +14,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { join, normalize, extname, basename, sep } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -157,6 +157,9 @@ const channels = new Map<string, Channel>();
 const messages = new Map<string, ChannelMessage[]>();
 const transfers = new Map<string, Transfer>();
 const owner: OwnerItem[] = [];
+const ownerAttachments = new Map<string, { id: string; name: string; size: number }>();
+const ownerUploads = new Map<string, { attachment: { id: string; name: string; size: number }; sha256: string }>();
+const ownerSends = new Map<string, { submissionId: string; text: string; attachments: string[] }>();
 const requests = new Map<string, OwnerRequest>();
 const followups = new Map<string, Followup>();
 /** Live working statuses (ch -> from -> event), replayed to a UI that connects mid-run. */
@@ -674,6 +677,24 @@ async function api(req: IncomingMessage, url: URL): Promise<unknown> {
       p2p: { mode: "files", available: true },
     };
   }
+  if (a === "owner" && b === "attachments" && c === "upload" && method === "POST") {
+    const name = url.searchParams.get("name") ?? "";
+    const uploadId = url.searchParams.get("uploadId") ?? "";
+    if (!name.trim() || Buffer.byteLength(name, "utf8") > 255 || !/^[A-Za-z0-9_-]{16,64}$/.test(uploadId)) throw new HttpError(400, "invalid owner attachment");
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of req) { size += chunk.byteLength; if (size > 25 * 1024 * 1024) throw new HttpError(413, "file too large"); chunks.push(Buffer.from(chunk)); }
+    const sha256 = createHash("sha256").update(Buffer.concat(chunks, size)).digest("hex");
+    const previous = ownerUploads.get(uploadId);
+    if (previous) {
+      if (previous.attachment.name !== name || previous.sha256 !== sha256) throw new HttpError(409, "upload ID was already used for different content");
+      return previous.attachment;
+    }
+    const attachment = { id: b64u(12), name, size };
+    ownerAttachments.set(attachment.id, attachment);
+    ownerUploads.set(uploadId, { attachment, sha256 });
+    return attachment;
+  }
   if (a === "owner" && b === "messages" && !c) {
     if (method === "GET") {
       const limit = Number(url.searchParams.get("limit") ?? 200);
@@ -682,11 +703,22 @@ async function api(req: IncomingMessage, url: URL): Promise<unknown> {
     if (method === "POST") {
       const body = await readJson(req);
       const text = typeof body.text === "string" ? body.text.trim() : "";
-      if (!text) throw new HttpError(400, "text is required");
+      const ids = Array.isArray(body.attachments) ? body.attachments.filter((id): id is string => typeof id === "string") : [];
+      const requestId = typeof body.requestId === "string" ? body.requestId : "";
+      const previous = requestId ? ownerSends.get(requestId) : undefined;
+      if (previous) {
+        if (previous.text !== text || previous.attachments.join("\0") !== ids.join("\0")) throw new HttpError(409, "request ID was already used for different content");
+        return { submissionId: previous.submissionId };
+      }
+      const attached = ids.map((id) => ownerAttachments.get(id));
+      if (!text && !ids.length) throw new HttpError(400, "text or attachments are required");
+      if (attached.some((item) => !item)) throw new HttpError(400, "attachment unavailable");
       if (ownerBusy) throw new HttpError(409, "Spencer is still working on the previous message");
-      emitOwner(addOwner({ role: "user", text }));
-      ownerReply(text);
-      return { submissionId: b64u(12) };
+      const submissionId = b64u(12);
+      if (requestId) ownerSends.set(requestId, { submissionId, text, attachments: ids });
+      emitOwner(addOwner({ role: "user", text, ...(attached.length ? { attachments: attached as { id: string; name: string; size: number }[] } : {}) }));
+      ownerReply(text || "I received the attached files.");
+      return { submissionId };
     }
   }
   if (a === "channels" && b) {
