@@ -979,7 +979,7 @@ export function createTransferService(deps: TransferDeps, options: TransferServi
         if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !dirStat.isDirectory() || dirStat.isSymbolicLink()) {
           throw new TransferError("bad_request", "quarantine location is invalid");
         }
-        handle = await open(expected, fsc.O_RDONLY | fsc.O_NOFOLLOW);
+        handle = await open(expected, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK);
         const before = await handle.stat();
         if (!before.isFile()) throw new TransferError("bad_request", "preview file is not a regular file");
         if (before.size > maxPreviewBytes) throw new TransferError("too_large", "preview is too large (1 MiB maximum)");

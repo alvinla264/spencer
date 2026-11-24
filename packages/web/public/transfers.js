@@ -62,11 +62,28 @@ const PREVIEW_EXT = /\.(?:md|markdown|html|htm)$/i;
 const STATIC_HTML_TAGS = new Set("article aside blockquote br caption dd div dl dt em figcaption figure footer header h1 h2 h3 h4 h5 h6 hr li main nav ol p pre section small span strong sub summary sup table tbody td tfoot th thead tr ul b i s u del ins mark abbr details code".split(" "));
 const VOID_HTML_TAGS = new Set(["br", "hr"]);
 const DROP_HTML_CONTENT = new Set("script style iframe frame object embed applet form button textarea select option audio video svg math".split(" "));
+const MAX_HTML_NESTING = 64;
+const MAX_HTML_NODES = 20_000;
+const HTML_ENTITIES = { amp: "&", apos: "'", gt: ">", lt: "<", nbsp: "\u00a0", quot: '\"' };
+
+function decodeHtmlText(text) {
+  return text.replace(/&(#(?:x[0-9a-f]+|[0-9]+)|amp|apos|gt|lt|nbsp|quot);/gi, (entity, value) => {
+    if (value[0] !== "#") return HTML_ENTITIES[value.toLowerCase()] ?? entity;
+    const code = Number.parseInt(value[1]?.toLowerCase() === "x" ? value.slice(2) : value.slice(1), value[1]?.toLowerCase() === "x" ? 16 : 10);
+    return Number.isInteger(code) && code > 0 && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff) ? String.fromCodePoint(code) : "\uFFFD";
+  });
+}
 
 function htmlPreview(source, title) {
   const root = h("div.document-preview-content.html-document", { "aria-label": `HTML preview of ${title}` });
+  const lowerSource = source.toLowerCase();
   const stack = [root];
+  let nodes = 0;
   let pos = 0;
+  const truncate = () => {
+    root.append(h("p.document-preview-truncated", null, "Preview truncated because the document is too complex."));
+    return root;
+  };
   while (pos < source.length) {
     if (source.startsWith("<!--", pos)) {
       const end = source.indexOf("-->", pos + 4);
@@ -99,7 +116,7 @@ function htmlPreview(source, title) {
         const selfClosing = source.slice(pos, end - 1).trimEnd().endsWith("/");
         pos = end;
         if (DROP_HTML_CONTENT.has(tagName) && !closing) {
-          const closeStart = source.toLowerCase().indexOf(`</${tagName}`, pos);
+          const closeStart = lowerSource.indexOf(`</${tagName}`, pos);
           const closeEnd = closeStart < 0 ? -1 : source.indexOf(">", closeStart + tagName.length + 2);
           pos = closeEnd < 0 ? source.length : closeEnd + 1;
           continue;
@@ -113,16 +130,23 @@ function htmlPreview(source, title) {
             }
           }
         } else {
+          if (nodes >= MAX_HTML_NODES) return truncate();
           const el = document.createElement(tagName);
           stack[stack.length - 1].append(el);
-          if (!selfClosing && !VOID_HTML_TAGS.has(tagName)) stack.push(el);
+          nodes++;
+          if (!selfClosing && !VOID_HTML_TAGS.has(tagName)) {
+            if (stack.length >= MAX_HTML_NESTING) return truncate();
+            stack.push(el);
+          }
         }
         continue;
       }
     }
     const next = source.indexOf("<", pos + 1);
     const end = next < 0 ? source.length : next;
-    stack[stack.length - 1].append(document.createTextNode(source.slice(pos, end)));
+    if (nodes >= MAX_HTML_NODES) return truncate();
+    stack[stack.length - 1].append(document.createTextNode(decodeHtmlText(source.slice(pos, end))));
+    nodes++;
     pos = end;
   }
   return root;
