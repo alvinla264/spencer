@@ -2080,14 +2080,6 @@ details[open] > summary > .icon:last-child,
 .document-preview-content > :last-child {
   margin-bottom: 0;
 }
-.document-preview-frame {
-  display: block;
-  width: 100%;
-  min-height: min(68vh, 760px);
-  background: #fff;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-}
 .xfer-actions {
   display: flex;
   flex-wrap: wrap;

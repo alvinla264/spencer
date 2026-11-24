@@ -59,24 +59,73 @@ async function act(t, action) {
 
 const PREVIEW_EXT = /\.(?:md|markdown|html|htm)$/i;
 
-function inertHtml(source) {
-  const unsafe = "script|iframe|frame|object|embed|applet|form|button|input|textarea|select|option|audio|video|source|track|link|base|meta|svg|math";
-  let html = source.replace(new RegExp(`<\\s*(${unsafe})\\b[^>]*>[\\s\\S]*?<\\/\\s*\\1\\s*>`, "gi"), "");
-  html = html.replace(new RegExp(`<\\/?(?:${unsafe})\\b[^>]*>`, "gi"), "");
-  return html.replace(/<([a-z][^>]*)>/gi, (tag) => tag
-    .replace(/\s(?:href|src|srcset|xlink:href|action|formaction|poster|background|data|manifest|ping|cite|longdesc|usemap|codebase|archive|profile)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, ""));
-}
+const STATIC_HTML_TAGS = new Set("article aside blockquote br caption dd div dl dt em figcaption figure footer header h1 h2 h3 h4 h5 h6 hr li main nav ol p pre section small span strong sub summary sup table tbody td tfoot th thead tr ul b i s u del ins mark abbr details code".split(" "));
+const VOID_HTML_TAGS = new Set(["br", "hr"]);
+const DROP_HTML_CONTENT = new Set("script style iframe frame object embed applet form button textarea select option audio video svg math".split(" "));
 
-function htmlPreview(source, name) {
-  const safeHtml = inertHtml(source);
-  const frame = document.createElement("iframe");
-  frame.className = "document-preview-frame";
-  frame.setAttribute("sandbox", "");
-  frame.setAttribute("referrerpolicy", "no-referrer");
-  frame.setAttribute("title", `HTML preview of ${name}`);
-  frame.srcdoc = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'none'; style-src 'unsafe-inline'; font-src 'none'; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'; navigate-to 'none'">${safeHtml}`;
-  return frame;
+function htmlPreview(source, title) {
+  const root = h("div.document-preview-content.html-document", { "aria-label": `HTML preview of ${title}` });
+  const stack = [root];
+  let pos = 0;
+  while (pos < source.length) {
+    if (source.startsWith("<!--", pos)) {
+      const end = source.indexOf("-->", pos + 4);
+      pos = end < 0 ? source.length : end + 3;
+      continue;
+    }
+    if (source.startsWith("<!", pos) || source.startsWith("<?", pos)) {
+      const end = source.indexOf(">", pos + 2);
+      pos = end < 0 ? source.length : end + 1;
+      continue;
+    }
+    if (source[pos] === "<") {
+      let i = pos + 1;
+      const closing = source[i] === "/";
+      if (closing) i++;
+      while (i < source.length && " \t\r\n".includes(source[i])) i++;
+      const start = i;
+      while (i < source.length && /[a-z0-9:-]/i.test(source[i])) i++;
+      const tagName = source.slice(start, i).toLowerCase();
+      if (tagName && /[a-z]/i.test(tagName[0])) {
+        let end = i;
+        let quote = "";
+        while (end < source.length) {
+          const c = source[end++];
+          if (quote) {
+            if (c === quote) quote = "";
+          } else if (c === '\"' || c === "'") quote = c;
+          else if (c === ">") break;
+        }
+        const selfClosing = source.slice(pos, end - 1).trimEnd().endsWith("/");
+        pos = end;
+        if (DROP_HTML_CONTENT.has(tagName) && !closing) {
+          const closeStart = source.toLowerCase().indexOf(`</${tagName}`, pos);
+          const closeEnd = closeStart < 0 ? -1 : source.indexOf(">", closeStart + tagName.length + 2);
+          pos = closeEnd < 0 ? source.length : closeEnd + 1;
+          continue;
+        }
+        if (!STATIC_HTML_TAGS.has(tagName)) continue;
+        if (closing) {
+          for (let k = stack.length - 1; k > 0; k--) {
+            if (stack[k].localName === tagName) {
+              stack.length = k;
+              break;
+            }
+          }
+        } else {
+          const el = document.createElement(tagName);
+          stack[stack.length - 1].append(el);
+          if (!selfClosing && !VOID_HTML_TAGS.has(tagName)) stack.push(el);
+        }
+        continue;
+      }
+    }
+    const next = source.indexOf("<", pos + 1);
+    const end = next < 0 ? source.length : next;
+    stack[stack.length - 1].append(document.createTextNode(source.slice(pos, end)));
+    pos = end;
+  }
+  return root;
 }
 
 async function previewTransfer(t) {
