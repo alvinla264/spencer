@@ -86,7 +86,7 @@ async function previewTransfer(t) {
     const result = await api.transferPreview(t.tid);
     if (!modal.el.isConnected) return;
     if (result.kind === "markdown") {
-      const rendered = h("div.document-preview-content", null, markdown(result.content));
+      const rendered = h("div.document-preview-content.md", null, markdown(result.content, undefined, { htmlPreview: false }));
       rendered.querySelectorAll("a").forEach((a) => a.replaceWith(...a.childNodes));
       status.replaceWith(rendered);
     } else if (result.kind === "html") {
